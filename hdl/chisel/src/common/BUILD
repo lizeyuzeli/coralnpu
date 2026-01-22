@@ -28,6 +28,13 @@ chisel_library(
 )
 
 chisel_library(
+    name = "index_allocator",
+    srcs = ["IndexAllocator.scala"],
+    deps = [":library"],
+    visibility = ["//visibility:public"],
+)
+
+chisel_library(
     name = "common",
     srcs = [
         "Fifo.scala",
@@ -42,9 +49,11 @@ chisel_library(
     visibility = ["//visibility:public"],
     exports = [
         ":library",
+        ":index_allocator",
     ],
     deps = [
         ":library",
+        ":index_allocator",
         "@chipsalliance_rocket_chip//:asyncqueue",
     ],
 )
@@ -243,5 +252,15 @@ chisel_test(
     deps = [
         ":common",
         "@chipsalliance_rocket_chip//:asyncqueue",
+    ],
+)
+
+chisel_test(
+    name = "index_allocator_test",
+    srcs = [
+        "IndexAllocatorTest.scala",
+    ],
+    deps = [
+        ":index_allocator",
     ],
 )
