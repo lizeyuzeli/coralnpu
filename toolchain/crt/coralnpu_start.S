@@ -26,6 +26,10 @@
         .global _start
         .type _start, @function
 _start:
+        csrw minstret, 0
+        csrw minstreth, 0
+        csrr a0, minstret
+        csrr a1, minstreth
         ###############################################
         # Put all scalar registers into a known state #
         ###############################################
@@ -82,6 +86,10 @@ init_array_loop_end:
         # install their own trap vector.
         la t0, coralnpu_exception_handler
         csrw mtvec, t0
+
+        # Set FS (0x6000) and VS (0x600) to Dirty
+        li      t0, 0x6600
+        csrrs   zero, mstatus, t0
 
         # Set up sentinel value in _ret
         # If we see this after an ebreak,

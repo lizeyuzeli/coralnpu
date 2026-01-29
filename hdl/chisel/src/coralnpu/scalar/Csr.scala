@@ -147,7 +147,7 @@ class Tdata1 extends Bundle {
 }
 
 class CsrCounters(p: Parameters) extends Bundle {
-  val nRetired = UInt(log2Ceil(p.instructionLanes + 1).W)
+  val nRetired = UInt(log2Ceil(p.retirementBufferSize + 1).W)
 }
 
 class CsrBruIO(p: Parameters) extends Bundle {
@@ -478,6 +478,8 @@ class Csr(p: Parameters) extends Module {
     io.rvv.get.frm                := frm
   }
 
+  val is_csr_write = req.valid && !(req.bits.op.isOneOf(CsrOp.CSRRS, CsrOp.CSRRC) && req.bits.rs1 === 0.U)
+
   // mcycle implementation
   // If one of the enable signals for
   // the register are true, overwrite the enabled half
@@ -486,14 +488,16 @@ class Csr(p: Parameters) extends Module {
   val mcycle_th = Mux(mcyclehEn, wdata, mcycle(63,32))
   val mcycle_tl = Mux(mcycleEn, wdata, mcycle(31,0))
   val mcycle_t = Cat(mcycle_th, mcycle_tl)
-  mcycle := Mux(req.valid, mcycle_t, mcycle) + 1.U
+  val mcycle_written = is_csr_write && (mcycleEn || mcyclehEn)
+  mcycle := Mux(mcycle_written, mcycle_t, mcycle + 1.U)
 
 
   val minstret_th = Mux(minstrethEn, wdata, minstret(63,32))
   val minstret_tl = Mux(minstretEn, wdata, minstret(31,0))
   val minstret_t = Cat(minstret_th, minstret_tl)
+  val minstret_written = is_csr_write && (minstretEn || minstrethEn)
   val minstretThisCycle = io.counters.nRetired
-  minstret := Mux(req.valid, minstret_t, minstret) + minstretThisCycle
+  minstret := Mux(minstret_written, minstret_t, minstret + minstretThisCycle)
 
   if (p.useDebugModule) {
     val trigger_enabled = tdata1.get.isTrigger6
