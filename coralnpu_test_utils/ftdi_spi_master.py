@@ -35,7 +35,7 @@ class FtdiSpiMaster:
             url,
             direction=0x0b, # SCK, MOSI, CS# outputs
             initial=0x08,   # CS# high
-            frequency=30E6)
+            frequency=1E6)
 
         # Enable 3-phase clocking to provide a hold time on data reads.
         # This is critical for the slave device to have time to drive the MISO
