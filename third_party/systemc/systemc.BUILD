@@ -19,7 +19,7 @@ cmake(
         "-G Ninja",
     ],
     install = True,
-    lib_source = "@accellera_systemc//:all_srcs",
+    lib_source = ":all_srcs",
     out_static_libs = ["libsystemc.a"],
     targets = ["systemc"],
     visibility = ["//visibility:public"],
