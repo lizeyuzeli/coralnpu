@@ -14,18 +14,18 @@
 
 package(default_visibility = ["//visibility:public"])
 
-filegroup(
-    name = "rtl_files",
-    srcs = glob([
-        "*.sv",
-        "*.core",
-    ]),
-)
-
-filegroup(
-    name = "dpi_files",
-    srcs = glob([
-        "*.cc",
-        "*.h",
-    ]),
+cc_library(
+    name = "conv_1x1",
+    srcs = [
+        "conv_1x1.cc",
+    ],
+    hdrs = ["conv_1x1.h"],
+    target_compatible_with = ["//platforms/cpu:coralnpu_v2"],
+    deps = [
+        "//sw/opt/litert-micro:accumulator_util",
+        "//sw/opt/litert-micro:memory_util",
+        "//sw/opt:rvv_opt",
+        "@tflite_micro//tensorflow/lite/kernels/internal:common",
+        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
+    ],
 )

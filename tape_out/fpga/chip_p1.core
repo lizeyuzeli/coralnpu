@@ -22,8 +22,8 @@ filesets:
       - xilinx:virtual:ddr4_0
     files:
       - rtl/chip_p1.sv
-      - rtl/clkgen_wrapper.sv
-      - rtl/clkgen_xilultrascaleplus.sv
+      - ../../fpga/rtl/clkgen_wrapper.sv
+      - ../../fpga/rtl/clkgen_xilultrascaleplus.sv
     file_type: systemVerilogSource
 
   files_constraints:
@@ -33,8 +33,8 @@ filesets:
 
   files_tcl:
     files:
-      - vivado_setup_hooks.tcl: { file_type: tclSource }
-      - vivado_hook_write_bitstream_post.tcl: { file_type: user, copyto: vivado_hook_write_bitstream_post.tcl }
+      - ../../fpga/vivado_setup_hooks.tcl: { file_type: tclSource }
+      - ../../fpga/vivado_hook_write_bitstream_post.tcl: { file_type: user, copyto: vivado_hook_write_bitstream_post.tcl }
 
 parameters:
   ClockFrequencyMhz:

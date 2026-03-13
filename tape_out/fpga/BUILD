@@ -18,6 +18,9 @@ load("//rules:coralnpu_v2.bzl", "coralnpu_v2_binary")
 load("//rules:utils.bzl", "cc_embed_data")
 load("@internal_check//:status.bzl", internal_exists = "FOLDER_EXISTS")
 
+load("//rules:coralnpu_v2.bzl", "coralnpu_v2_binary")
+load("//rules:utils.bzl", "generate_cc_arrays")
+
 package(default_visibility = ["//visibility:public"])
 
 _CLOCK_FREQUENCY_MHZ = "10"
@@ -26,108 +29,55 @@ _NEXUS_CLOCK_FREQUENCY_MHZ = "10"
 filegroup(
     name = "rtl_files",
     srcs = glob(["**/*.sv"]) + glob(["**/*.core"]) + [
-        "//tape_out/fpga/ip/spi_dpi_master:rtl_files",
-        "//tape_out/fpga/ip/coralnpu_tlul:rtl_files",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_default:rtl_files",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_highmem:rtl_files",
-        "//tape_out/fpga/ip/sram:rtl_files",
         "//tape_out/fpga/rtl:rtl_files",
     ],
 )
 
-VERILATOR_OPTIONS_COMMON = [
-    "-Wno-ALWCOMBORDER",
-    "-Wno-WIDTHEXPAND",
-    "-Wno-WIDTHTRUNC",
-    "-Wno-UNUSEDSIGNAL",
-    "-Wno-UNUSEDPARAM",
-    "-Wno-VARHIDDEN",
-    # TODO: The MULTIDRIVEN warnings are caused by the `prim_arbiter_fixed`
-    # module and the `tlul_fifo_sync` module. We should investigate these
-    # modules and fix the underlying issues.
-    # "-Wno-MULTIDRIVEN",
-    "-Wno-UNOPTTHREADS",
-    "-Wno-GENUNNAMED",
-    "-Wno-DECLFILENAME",
-    "-Wno-ASCRANGE",
-    "-DRVFI",
-    "-DUSE_GENERIC",
-    "-DUSE_DPI_MEMORY",
-]
-
-string_list_flag(
-    name = "verilator_options_default",
-    build_setting_default = VERILATOR_OPTIONS_COMMON,
-)
-string_list_flag(
-    name = "verilator_options_highmem",
-    build_setting_default = [
-        "-CFLAGS \"-DCHISEL_SUBSYSTEM_HIGHMEM\"",
-    ] + VERILATOR_OPTIONS_COMMON,
-)
-
-string_list_flag(
-    name = "make_options",
-    build_setting_default = [
-        "-j16",
+coralnpu_v2_binary(
+    name = "run_mobilenet_1x1_v1_025_partial_binary",
+    srcs = [
+        "mobilenet_v1_025_partial_layers_cc",
+        "sw/run_mobilenet_1x1_partial_layers.cc",
+    ],
+    copts = ["-DCLOCK_FREQUENCY_MHZ=" + _CLOCK_FREQUENCY_MHZ],
+    hdrs = ["mobilenet_v1_025_partial_layers.h"],
+    dtcm_size_kbytes = 1024,  # Highmem
+    itcm_size_kbytes = 1024,  # Highmem
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tape_out/sw/opt/litert-micro:conv_1x1",
+        "//sw/opt/litert-micro:depthwise_conv",
+        "@tflite_micro//tensorflow/lite/micro:micro_framework",
+        "@tflite_micro//tensorflow/lite/micro:micro_log",
+        "@tflite_micro//tensorflow/lite/micro:micro_profiler",
+        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
+        "@tflite_micro//tensorflow/lite/micro:system_setup",
+        "//fpga:uart",
     ],
 )
 
-cc_embed_data(
-    name = "add_uint32_m1_bin_header",
-    srcs = [":add_uint32_m1_bin"],
-    var_name = "add_uint32_m1_bin",
+generate_cc_arrays(
+    name = "mobilenet_v1_025_partial_layers_cc",
+    src = "sw/models/mobilenet_v1_025_partial_layers.tflite",
+    out = "mobilenet_v1_025_partial_layers.cc",
 )
 
-coralnpu_v2_binary(
-    name = "add_uint32_m1",
-    srcs = ["sw/add_uint32_m1.cc"],
-    copts = ["-DCLOCK_FREQUENCY_MHZ=" + _CLOCK_FREQUENCY_MHZ],
-)
-
-# Highmem variant: needed when running on `build_chip_p1_bitstream_highmem`.
-# The highmem SoC maps DTCM at 0x0010_0000 and CSR at 0x0020_0000.
-coralnpu_v2_binary(
-    name = "add_uint32_m1_highmem",
-    srcs = ["sw/add_uint32_m1.cc"],
-    copts = ["-DCLOCK_FREQUENCY_MHZ=" + _CLOCK_FREQUENCY_MHZ],
-    itcm_size_kbytes = 1024,
-    dtcm_size_kbytes = 1024,
-)
-
-filegroup(
-    name = "add_uint32_m1_bin",
-    srcs = [":add_uint32_m1"],
-    output_group = "bin_file",
-)
-
-filegroup(
-    name = "add_uint32_m1_vmem",
-    srcs = [":add_uint32_m1"],
-    output_group = "vmem_file",
-)
-
-filegroup(
-    name = "add_uint32_m1_highmem_bin",
-    srcs = [":add_uint32_m1_highmem"],
-    output_group = "bin_file",
-)
-
-filegroup(
-    name = "add_uint32_m1_highmem_vmem",
-    srcs = [":add_uint32_m1_highmem"],
-    output_group = "vmem_file",
+generate_cc_arrays(
+    name = "mobilenet_v1_025_partial_layers_h",
+    src = "sw/models/mobilenet_v1_025_partial_layers.tflite",
+    out = "mobilenet_v1_025_partial_layers.h",
 )
 
 CORALNPU_SOC_CORES = [
-    ":coralnpu_soc.core",
-    ":coralnpu_soc_pkg.core",
-    ":racl_pkg.core",
+    "//fpga:coralnpu_soc.core",
+    "//fpga:coralnpu_soc_pkg.core",
+    "//fpga:racl_pkg.core",
     "@lowrisc_opentitan_gh//hw:check_tool_requirements.core",
 ]
 
 CORALNPU_SOC_SRCS = [
     ":rtl_files",
+    "//fpga:rtl_files",
     "@lowrisc_opentitan_gh//hw/dv/sv:dv_macros",
     "@lowrisc_opentitan_gh//hw/dv:verilator_files",
     "@lowrisc_opentitan_gh//hw:check_tool_requirements.py",
@@ -147,62 +97,9 @@ CORALNPU_SOC_SRCS = [
     "@lowrisc_opentitan_gh//hw:vendor/pulp_riscv_dbg/src/dmi_jtag.sv",
     "@lowrisc_opentitan_gh//hw:vendor/pulp_riscv_dbg/src/dmi_jtag_tap.sv",
     "@lowrisc_opentitan_gh//hw:verilator_files",
-    "main.cc",
+    "//fpga:main.cc",
 ]
 
-fusesoc_build(
-    name = "build_chip_verilator",
-    srcs = CORALNPU_SOC_SRCS + [
-        "//tape_out/fpga/ip/spi_dpi_master:dpi_files",
-        "@lowrisc_opentitan_gh//hw:dpi_files",
-    ],
-    cores = CORALNPU_SOC_CORES + [
-        ":chip_verilator.core",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_default:coralnpu_chisel_subsystem_default.core",
-        "//tape_out/fpga/ip/spi_dpi_master:spi_dpi_master.core",
-        "@lowrisc_opentitan_gh//hw/dv:dpi/uartdpi/uartdpi.core",
-        "@lowrisc_opentitan_gh//hw/dv:dpi/uartdpi/uartdpi_sv.core",
-    ],
-    flags = [
-        "--ClockFrequencyMhz=" + _CLOCK_FREQUENCY_MHZ,
-    ],
-    make_options = ":make_options",
-    output_groups = {
-        "binary": ["com.google.coralnpu_fpga_chip_verilator_0.1/sim-verilator/Vchip_verilator"],
-    },
-    systems = ["com.google.coralnpu:fpga:chip_verilator:0.1"],
-    target = "sim",
-    verilator_options = ":verilator_options_default",
-    tags = ["manual"],
-)
-
-fusesoc_build(
-    name = "build_chip_verilator_highmem",
-    srcs = CORALNPU_SOC_SRCS + [
-        "//tape_out/fpga/ip/spi_dpi_master:dpi_files",
-        "@lowrisc_opentitan_gh//hw:dpi_files",
-    ],
-    cores = CORALNPU_SOC_CORES + [
-        ":chip_verilator.core",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_highmem:coralnpu_chisel_subsystem_highmem.core",
-        "//tape_out/fpga/ip/spi_dpi_master:spi_dpi_master.core",
-        "@lowrisc_opentitan_gh//hw/dv:dpi/uartdpi/uartdpi.core",
-        "@lowrisc_opentitan_gh//hw/dv:dpi/uartdpi/uartdpi_sv.core",
-    ],
-    flags = [
-        "--ClockFrequencyMhz=" + _CLOCK_FREQUENCY_MHZ,
-    ],
-    make_options = ":make_options",
-    output_groups = {
-        "binary": ["com.google.coralnpu_fpga_chip_verilator_0.1/sim-verilator/Vchip_verilator"],
-    },
-    systems = ["com.google.coralnpu:fpga:chip_verilator:0.1"],
-    target = "sim",
-    verilator_options = ":verilator_options_highmem",
-    tags = ["manual"],
-)
-
-_PREFIX = "../../../../../../../../.."
 DDR_CORES = [
     "//internal/fpga/ip/ddr4:ddr4.core",
     "//internal/fpga/ip/ddr4_phy:ddr4_phy.core",
@@ -221,12 +118,12 @@ fusesoc_build(
     name = "build_chip_p1_bitstream",
     srcs = CORALNPU_SOC_SRCS + [
         "pins_p1.xdc",
-        "vivado_setup_hooks.tcl",
-        "vivado_hook_write_bitstream_post.tcl",
+        "//fpga:vivado_setup_hooks.tcl",
+        "//fpga:vivado_hook_write_bitstream_post.tcl",
     ] + DDR_SRCS,
     cores = CORALNPU_SOC_CORES + [
         ":chip_p1.core",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_default:coralnpu_chisel_subsystem_default.core",
+        "//fpga/ip/coralnpu_chisel_subsystem_default:coralnpu_chisel_subsystem_default.core",
     ] + DDR_CORES,
     flags = [
         "--ClockFrequencyMhz=" + _NEXUS_CLOCK_FREQUENCY_MHZ,
@@ -243,12 +140,13 @@ fusesoc_build(
     name = "build_chip_p1_bitstream_highmem",
     srcs = CORALNPU_SOC_SRCS + [
         "pins_p1.xdc",
-        "vivado_setup_hooks.tcl",
-        "vivado_hook_write_bitstream_post.tcl",
+        "//fpga:vivado_setup_hooks.tcl",
+        "//fpga:vivado_hook_write_bitstream_post.tcl",
     ] + DDR_SRCS,
     cores = CORALNPU_SOC_CORES + [
         ":chip_p1.core",
-        "//tape_out/fpga/ip/coralnpu_chisel_subsystem_highmem:coralnpu_chisel_subsystem_highmem.core",
+        "//fpga/ip/i2c_master:i2c_master.core",
+        "//fpga/ip/coralnpu_chisel_subsystem_highmem:coralnpu_chisel_subsystem_highmem.core",
     ] + DDR_CORES,
     flags = [
         "--ClockFrequencyMhz=" + _NEXUS_CLOCK_FREQUENCY_MHZ,
@@ -258,20 +156,5 @@ fusesoc_build(
     },
     systems = ["com.google.coralnpu:fpga:chip_p1:0.1"],
     target = "synth",
-    tags = ["manual"],
-)
-
-filegroup(
-    name = "chip_verilator_binary",
-    srcs = [":build_chip_verilator"],
-    output_group = "binary",
-    tags = ["manual"],
-)
-
-genrule(
-    name = "copy_chip_verilator_binary",
-    srcs = [":chip_verilator_binary"],
-    outs = ["Vchip_verilator"],
-    cmd = "cp $< $@",
     tags = ["manual"],
 )

@@ -22,20 +22,19 @@ module chip_p1
      input spi_csb_i,
      input spi_mosi_i,
      output logic spi_miso_o,
+     output logic spim_sclk_o,
+     output logic spim_csb_o,
+     output logic spim_mosi_o,
+     input spim_miso_i,
+     inout wire [3:0] gpio,
      output [1 : 0] uart_tx_o,
      input [1 : 0] uart_rx_i,
+     inout wire i2c_scl,
+     inout wire i2c_sda,
      output logic io_halted,
      output logic io_fault,
      output logic io_ddr_mem_axi_aw_ready,
      output logic io_ddr_mem_axi_ar_ready,
-     output logic spi_clk_probe_o,
-     output logic spi_csb_probe_o,
-     output logic spi_mosi_probe_o,
-     output logic spi_miso_probe_o,
-     output logic ddr4_en_vtt_bbox,
-     output logic ddr4_en_vddq_bbox,
-     output logic ddr4_en_vcc2v5_bbox,
-     input  logic power_good_bbox,
      output logic c0_ddr4_act_n,
      output logic [16:0] c0_ddr4_adr,
      output logic [1:0] c0_ddr4_ba,
@@ -43,36 +42,41 @@ module chip_p1
      output logic [1:0] c0_ddr4_cke,
      output logic [1:0] c0_ddr4_odt,
      output logic [1:0] c0_ddr4_cs_n,
-     output logic [1:0] c0_ddr4_ck_t,
-     output logic [1:0] c0_ddr4_ck_c,
+     output logic [0:0] c0_ddr4_ck_t,
+     output logic [0:0] c0_ddr4_ck_c,
      output logic c0_ddr4_reset_n,
-     inout  wire [7:0]  c0_ddr4_dm_dbi_n,
-     inout  wire [63:0] c0_ddr4_dq,
-     inout  wire [7:0]  c0_ddr4_dqs_c,
-     inout  wire [7:0]  c0_ddr4_dqs_t,
+     output logic c0_ddr4_parity,
+     inout wire [71:0] c0_ddr4_dq,
+     inout wire [17:0] c0_ddr4_dqs_c,
+     inout wire [17:0] c0_ddr4_dqs_t,
      input logic c0_sys_clk_p,
      input logic c0_sys_clk_n,
      output logic ddr_cal_complete_o,
      output ddr_ui_clk,
-     output ddr_ui_clk_sync_rst
+     output ddr_ui_clk_sync_rst,
+     input tck_i,
+     input tms_i,
+     input trst_ni,
+     input td_i,
+     output td_o,
+     output logic ddr4_en_vtt_bbox,
+     output logic ddr4_en_vddq_bbox,
+     output logic ddr4_en_vcc2v5_bbox,
+     input  logic power_good_bbox
     );
 
   logic clk;
   logic rst_n;
   logic clk_48MHz;
   logic clk_aon;
+  logic clk_spim;
   logic locked;
   logic eos;
   logic mig_sys_rst;
   logic c0_init_calib_complete;
   logic c0_ddr4_ui_clk;
   logic c0_ddr4_ui_clk_sync_rst;
-  logic c0_ddr4_parity;
 
-  assign spi_clk_probe_o = spi_clk_i;
-  assign spi_csb_probe_o = spi_csb_i;
-  assign spi_mosi_probe_o = spi_mosi_i;
-  assign spi_miso_probe_o = spi_miso_o;
   assign ddr_ui_clk = c0_ddr4_ui_clk;
   assign ddr_ui_clk_sync_rst = c0_ddr4_ui_clk_sync_rst;
 
@@ -120,6 +124,29 @@ module chip_p1
   assign uart_sideband_i[1].cio_rx = uart_rx_i[1];
   assign uart_tx_o[0] = uart_sideband_o[0].cio_tx;
   assign uart_tx_o[1] = uart_sideband_o[1].cio_tx;
+
+  wire [7:0] gpio_out;
+  wire [7:0] gpio_en;
+  wire [7:0] gpio_in;
+
+  genvar i;
+  generate
+    for (i = 0; i < 4; i = i + 1) begin : gen_gpio_iobuf
+      IOBUF i_iobuf (
+        .O(gpio_in[i]),
+        .IO(gpio[i]),
+        .I(gpio_out[i]),
+        .T(~gpio_en[i]) // T is active low enable (Tristate)
+      );
+    end
+  endgenerate
+  assign gpio_in[7:4] = 4'b0;
+
+  logic scl_in, scl_out, scl_en;
+  logic sda_in, sda_out, sda_en;
+
+  IOBUF i_scl_iobuf (.O(scl_in), .IO(i2c_scl), .I(scl_out), .T(~scl_en));
+  IOBUF i_sda_iobuf (.O(sda_in), .IO(i2c_sda), .I(sda_out), .T(~sda_en));
 
   assign ddr_cal_complete_o = c0_init_calib_complete;
   logic dbg_clk;
@@ -216,7 +243,6 @@ module chip_p1
     .c0_ddr4_ck_c(c0_ddr4_ck_c),
     .c0_ddr4_reset_n(c0_ddr4_reset_n),
     .c0_ddr4_parity(c0_ddr4_parity),
-    .c0_ddr4_dm_dbi_n(c0_ddr4_dm_dbi_n),
     .c0_ddr4_dq(c0_ddr4_dq),
     .c0_ddr4_dqs_c(c0_ddr4_dqs_c),
     .c0_ddr4_dqs_t(c0_ddr4_dqs_t),
@@ -308,8 +334,35 @@ module chip_p1
                .clk_main_o(clk),
                .clk_48MHz_o(clk_48MHz),
                .clk_aon_o(clk_aon),
+               .clk_spim_o(clk_spim),
                .rst_no(rst_n),
                .locked_o(locked));
+
+  logic dm_req_valid, dm_req_ready;
+  dm::dmi_req_t dm_req;
+  logic dm_rsp_valid, dm_rsp_ready;
+  dm::dmi_resp_t dm_rsp;
+  logic dmi_rst_n;
+
+  dmi_jtag #(.IdcodeValue(32'h04f5484d)) i_jtag (
+    .clk_i(clk),
+    .rst_ni(rst_n),
+    .testmode_i(1'b0),
+    .test_rst_ni(1'b1),
+    .dmi_rst_no(dmi_rst_n),
+    .dmi_req_o(dm_req),
+    .dmi_req_valid_o(dm_req_valid),
+    .dmi_req_ready_i(dm_req_ready),
+    .dmi_resp_i(dm_rsp),
+    .dmi_resp_ready_o(dm_rsp_ready),
+    .dmi_resp_valid_i(dm_rsp_valid),
+    .tck_i(tck_i),
+    .tms_i(tms_i),
+    .trst_ni(trst_ni),
+    .td_i(td_i),
+    .td_o(td_o),
+    .tdo_oe_o(/*tdo_oe_o*/)
+  );
 
   coralnpu_soc i_coralnpu_soc (
     .clk_i(clk),
@@ -318,9 +371,23 @@ module chip_p1
     .spi_csb_i(spi_csb_i),
     .spi_mosi_i(spi_mosi_i),
     .spi_miso_o(spi_miso_o),
+    .spim_sclk_o(spim_sclk_o),
+    .spim_csb_o(spim_csb_o),
+    .spim_mosi_o(spim_mosi_o),
+    .spim_miso_i(spim_miso_i),
+    .spim_clk_i(clk_spim),
+    .gpio_o(gpio_out),
+    .gpio_en_o(gpio_en),
+    .gpio_i(gpio_in),
     .scanmode_i('0),
     .uart_sideband_i(uart_sideband_i),
     .uart_sideband_o(uart_sideband_o),
+    .scl_i(scl_in),
+    .scl_o(scl_out),
+    .scl_en_o(scl_en),
+    .sda_i(sda_in),
+    .sda_o(sda_out),
+    .sda_en_o(sda_en),
     .io_halted(io_halted),
     .io_fault(io_fault),
     .ddr_clk_i(c0_ddr4_ui_clk),
@@ -377,7 +444,16 @@ module chip_p1
     .io_ddr_mem_axi_r_bits_data(c0_ddr4_s_axi_rdata),
     .io_ddr_mem_axi_r_bits_id(c0_ddr4_s_axi_rid),
     .io_ddr_mem_axi_r_bits_resp(c0_ddr4_s_axi_rresp),
-    .io_ddr_mem_axi_r_bits_last(c0_ddr4_s_axi_rlast)
+    .io_ddr_mem_axi_r_bits_last(c0_ddr4_s_axi_rlast),
+    .io_dm_req_valid(dm_req_valid),
+    .io_dm_req_ready(dm_req_ready),
+    .io_dm_req_bits_address(dm_req.addr),
+    .io_dm_req_bits_data(dm_req.data),
+    .io_dm_req_bits_op(dm_req.op),
+    .io_dm_rsp_ready(dm_rsp_ready),
+    .io_dm_rsp_valid(dm_rsp_valid),
+    .io_dm_rsp_bits_data(dm_rsp.data),
+    .io_dm_rsp_bits_op(dm_rsp.resp)
   );
 
 endmodule

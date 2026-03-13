@@ -26,12 +26,22 @@ create_generated_clock -name clk_aon [get_pin i_clkgen/i_clkgen/pll/CLKOUT4]
 # Reset
 set_property -dict { PACKAGE_PIN T42 IOSTANDARD LVCMOS18 } [get_ports { rst_ni }];
 
+# JTAG
+# 500 kHz clock constraint
+create_clock -period 2000.00 -name jtag_tck_i -waveform {0 1000} [get_ports {tck_i}]
+set_property -dict { PACKAGE_PIN U54 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN } [get_ports {tms_i}]
+set_property -dict { PACKAGE_PIN T53 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN } [get_ports {td_o}]
+set_property -dict { PACKAGE_PIN T52 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN } [get_ports {td_i}]
+set_property -dict { PACKAGE_PIN V52 IOSTANDARD LVCMOS18 PULLTYPE PULLDOWN } [get_ports {tck_i}]
+set_property -dict { PACKAGE_PIN U52 IOSTANDARD LVCMOS18 } [get_ports {trst_ni}]
+
+
 # SPI
 create_clock -period 83.333 -name spi_clk_i -waveform {0 41.667} [get_ports spi_clk_i]
-set_property -dict { PACKAGE_PIN W50 IOSTANDARD LVCMOS18 } [get_ports { spi_clk_i }];
-set_property -dict { PACKAGE_PIN R51 IOSTANDARD LVCMOS18 } [get_ports { spi_csb_i }];
-set_property -dict { PACKAGE_PIN R52 IOSTANDARD LVCMOS18 } [get_ports { spi_mosi_i }];
-set_property -dict { PACKAGE_PIN U50 IOSTANDARD LVCMOS18 } [get_ports { spi_miso_o }];
+set_property -dict { PACKAGE_PIN W50 IOSTANDARD LVCMOS18 } [get_ports { spi_clk_i }]; # J4 gpio1
+set_property -dict { PACKAGE_PIN R51 IOSTANDARD LVCMOS18 } [get_ports { spi_csb_i }]; # J4 gpio2
+set_property -dict { PACKAGE_PIN R52 IOSTANDARD LVCMOS18 } [get_ports { spi_mosi_i }]; # J4 gpio3
+set_property -dict { PACKAGE_PIN U50 IOSTANDARD LVCMOS18 } [get_ports { spi_miso_o }]; # J4 gpio4
 
 # NOTE: The P1 board's SPI clock pin may not be a GCIO-capable pin.
 # Vivado may try to route `spi_clk_i` onto a global clock network (BUFG), which
@@ -62,10 +72,25 @@ set_property -dict { PACKAGE_PIN B24 IOSTANDARD LVCMOS18 } [get_ports { ddr_ui_c
 set_clock_groups -asynchronous \
   -group [get_clocks -include_generated_clocks sys_clk_pin] \
   -group [get_clocks -include_generated_clocks c0_sys_clk_p] \
-  -group [get_clocks spi_clk_i]
+  -group [get_clocks spi_clk_i] \
+  -group [get_clocks jtag_tck_i]
 
-# SPI Probe Outputs (PMOD3)
-set_property -dict { PACKAGE_PIN U40 IOSTANDARD LVCMOS18 } [get_ports { spi_clk_probe_o }];
-set_property -dict { PACKAGE_PIN T40 IOSTANDARD LVCMOS18 } [get_ports { spi_csb_probe_o }];
-set_property -dict { PACKAGE_PIN U41 IOSTANDARD LVCMOS18 } [get_ports { spi_mosi_probe_o }];
-set_property -dict { PACKAGE_PIN V53 IOSTANDARD LVCMOS18 } [get_ports { spi_miso_probe_o }];
+# SPI Probe Outputs (PMOD3) -> Reassigned to SpiMaster
+set_property -dict { PACKAGE_PIN U41 IOSTANDARD LVCMOS18 } [get_ports { spim_sclk_o }]; # J4 gpio14
+set_property -dict { PACKAGE_PIN T40 IOSTANDARD LVCMOS18 } [get_ports { spim_csb_o }]; # J4 gpio13
+set_property -dict { PACKAGE_PIN U40 IOSTANDARD LVCMOS18 } [get_ports { spim_mosi_o }]; # J4 gpio12
+set_property -dict { PACKAGE_PIN U46 IOSTANDARD LVCMOS18 } [get_ports { spim_miso_i }]; # J4 gpio11
+
+# I2C (PMOD2)
+set_property -dict { PACKAGE_PIN T50 IOSTANDARD LVCMOS18 } [get_ports { i2c_scl }]; # J4 gpio5
+set_property -dict { PACKAGE_PIN W51 IOSTANDARD LVCMOS18 } [get_ports { i2c_sda }]; # J4 gpio6
+
+set_property -dict { PACKAGE_PIN W49 IOSTANDARD LVCMOS18 } [get_ports { gpio[0] }]; # J4 gpio0
+set_property -dict { PACKAGE_PIN V43 IOSTANDARD LVCMOS18 } [get_ports { gpio[1] }]; # J4 gpio8
+set_property -dict { PACKAGE_PIN V44 IOSTANDARD LVCMOS18 } [get_ports { gpio[2] }]; # J4 gpio9
+set_property -dict { PACKAGE_PIN V46 IOSTANDARD LVCMOS18 } [get_ports { gpio[3] }]; # J4 gpio10
+
+# set_property -dict { PACKAGE_PIN U40 IOSTANDARD LVCMOS18 } [get_ports { spi_clk_probe_o }]; # J4 gpio12
+# set_property -dict { PACKAGE_PIN T40 IOSTANDARD LVCMOS18 } [get_ports { spi_csb_probe_o }]; # J4 gpio13
+# set_property -dict { PACKAGE_PIN U41 IOSTANDARD LVCMOS18 } [get_ports { spi_mosi_probe_o }]; # J4 gpio14
+# set_property -dict { PACKAGE_PIN V53 IOSTANDARD LVCMOS18 } [get_ports { spi_miso_probe_o }]; # J4 gpio15
