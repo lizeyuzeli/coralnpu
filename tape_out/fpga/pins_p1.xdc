@@ -49,6 +49,7 @@ set_property -dict { PACKAGE_PIN U50 IOSTANDARD LVCMOS18 } [get_ports { spi_miso
 # we allow non-dedicated routing to unblock implementation.
 # Prefer a GCIO pin or redesign SPI to avoid using SCK as a fabric clock.
 set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets spi_clk_i_IBUF_inst/O]
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets tck_i_IBUF_inst/O]
 
 # UART0
 set_property -dict { PACKAGE_PIN R46 IOSTANDARD LVCMOS18 } [get_ports { uart_tx_o[0] }];

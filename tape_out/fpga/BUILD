@@ -30,7 +30,17 @@ filegroup(
     name = "rtl_files",
     srcs = glob(["**/*.sv"]) + glob(["**/*.core"]) + [
         "//tape_out/fpga/rtl:rtl_files",
+        "//fpga:rtl_files",
     ],
+)
+
+coralnpu_v2_binary(
+    name = "add_uint32_m1_highmem",
+    srcs = ["sw/add_uint32_m1.cc"],
+    copts = ["-DCLOCK_FREQUENCY_MHZ=" + _CLOCK_FREQUENCY_MHZ],
+    dtcm_size_kbytes = 1024,  # Highmem
+    itcm_size_kbytes = 1024,  # Highmem
+    deps = ["//fpga:uart"],
 )
 
 coralnpu_v2_binary(
@@ -77,7 +87,6 @@ CORALNPU_SOC_CORES = [
 
 CORALNPU_SOC_SRCS = [
     ":rtl_files",
-    "//fpga:rtl_files",
     "@lowrisc_opentitan_gh//hw/dv/sv:dv_macros",
     "@lowrisc_opentitan_gh//hw/dv:verilator_files",
     "@lowrisc_opentitan_gh//hw:check_tool_requirements.py",

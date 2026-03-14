@@ -19,6 +19,7 @@ filesets:
   files_rtl:
     depend:
       - com.google.coralnpu:fpga:coralnpu_soc
+      - pulp-platform:riscv-dbg:0.1
       - xilinx:virtual:ddr4_0
     files:
       - rtl/chip_p1.sv
@@ -57,6 +58,21 @@ parameters:
     description: "Use Xilinx FPGA primitives"
     default: false
     paramtype: vlogdefine
+  TB_SUPPORT:
+    datatype: bool
+    description: "Enable TB support in RVV"
+    default: true
+    paramtype: vlogdefine
+  VLEN_128:
+    datatype: bool
+    description: "Set RVV VLEN to 128"
+    default: true
+    paramtype: vlogdefine
+  ZVE32F_ON:
+    datatype: bool
+    description: "Enable ZVE32F RVV profile"
+    default: true
+    paramtype: vlogdefine
 
 targets:
   default: &default_target
@@ -73,6 +89,9 @@ targets:
       - MemInitFile
       - USE_GENERIC=true
       - FPGA_XILINX=true
+      - TB_SUPPORT=true
+      - VLEN_128=true
+      - ZVE32F_ON=true
     tools:
       vivado:
         part: "xcvu440-flga2892-1-c"
