@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,23 +15,8 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
-    name = "conv_1x1",
-    srcs = [
-        "conv_1x1.cc",
-    ],
-    hdrs = ["conv_1x1.h"],
-    target_compatible_with = ["//platforms/cpu:coralnpu_v2"],
-    deps = [
-        "//sw/opt/litert-micro:accumulator_util",
-        "//sw/opt/litert-micro:memory_util",
-        "//sw/opt:rvv_opt",
-        "@tflite_micro//tensorflow/lite/kernels/internal:common",
-        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
-    ],
-)
-
-cc_library(
     name = "gemm",
+    srcs = ["gemm.cc"],
+    hdrs = ["gemm.h"],
     target_compatible_with = ["//platforms/cpu:coralnpu_v2"],
-    deps = ["//tape_out/sw/opt/generic_kernels:gemm"],
 )

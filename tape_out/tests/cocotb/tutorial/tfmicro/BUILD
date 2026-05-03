@@ -24,6 +24,8 @@ load(
     "VERILATOR_BUILD_ARGS",
 )
 
+package(default_visibility = ["//visibility:public"])
+
 coralnpu_v2_binary(
     name = "conv2d_1x1_test",
     srcs = ["conv2d_1x1_test.cc"],
@@ -127,6 +129,136 @@ cocotb_test_suite(
             "@rules_python//python/runfiles",
         ],
         "data": ["run_mobilenet_1x1_v1_025_partial_binary.elf"],
+    },
+    vcs_build_args = VCS_BUILD_ARGS,
+    vcs_data = glob(["**/*.elf"]) + [
+        "//tests/cocotb:coverage_exclude.cfg",
+    ],
+    vcs_defines = VCS_DEFINES,
+    vcs_test_args = VCS_TEST_ARGS,
+    vcs_verilog_sources = ["//hdl/chisel/src/coralnpu:rvv_core_mini_highmem_axi_cc_library_verilog"],
+    verilator_model = "//tests/cocotb:rvv_core_mini_highmem_axi_model",
+)
+
+coralnpu_v2_binary(
+    name = "run_mobilenet_1x1_v1_binary",
+    srcs = [
+        "mobilenet_v1_1_0_224_quantized_metadata_cc",
+        "run_mobilenet_1x1_v1.cc",
+    ],
+    hdrs = ["mobilenet_v1_1_0_224_quantized_metadata.h"],
+    dtcm_size_kbytes = 1024,  # Highmem
+    itcm_size_kbytes = 1024,  # Highmem
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tape_out/sw/opt/litert-micro:conv_1x1",
+        "//sw/opt/litert-micro:depthwise_conv",
+        "@tflite_micro//tensorflow/lite/micro:micro_framework",
+        "@tflite_micro//tensorflow/lite/micro:micro_log",
+        "@tflite_micro//tensorflow/lite/micro:micro_profiler",
+        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
+        "@tflite_micro//tensorflow/lite/micro:system_setup",
+    ],
+)
+
+generate_cc_arrays(
+    name = "mobilenet_v1_1_0_224_quantized_metadata_cc",
+    src = "models/mobilenet_v1_1_0_224_quantized_metadata.tflite",
+    out = "mobilenet_v1_1_0_224_quantized_metadata.cc",
+)
+
+generate_cc_arrays(
+    name = "mobilenet_v1_1_0_224_quantized_metadata_h",
+    src = "models/mobilenet_v1_1_0_224_quantized_metadata.tflite",
+    out = "mobilenet_v1_1_0_224_quantized_metadata.h",
+)
+
+cocotb_test_suite(
+    name = "cocotb_run_mobilenet_1x1_v1",
+    simulators = [
+        "verilator",
+        "vcs",
+    ],
+    testcases = RUN_MOBILENET_TEST,
+    testcases_vname = "RUN_MOBILENET_TEST",
+    tests_kwargs = {
+        "waves": False,
+        "tags": ["manual"],
+        "hdl_toplevel": "RvvCoreMiniHighmemAxi",
+        "seed": "42",
+        "size": "enormous",
+        "test_module": ["cocotb_run_mobilenet_1x1_v1.py"],
+        "deps": [
+            "//coralnpu_test_utils:core_mini_axi_sim_interface",
+            "//coralnpu_test_utils:sim_test_fixture",
+            "@rules_python//python/runfiles",
+        ],
+        "data": ["run_mobilenet_1x1_v1_binary.elf"],
+    },
+    vcs_build_args = VCS_BUILD_ARGS,
+    vcs_data = glob(["**/*.elf"]) + [
+        "//tests/cocotb:coverage_exclude.cfg",
+    ],
+    vcs_defines = VCS_DEFINES,
+    vcs_test_args = VCS_TEST_ARGS,
+    vcs_verilog_sources = ["//hdl/chisel/src/coralnpu:rvv_core_mini_highmem_axi_cc_library_verilog"],
+    verilator_model = "//tests/cocotb:rvv_core_mini_highmem_axi_model",
+)
+
+coralnpu_v2_binary(
+    name = "run_mobilenet_1x1_v1_dummy_binary",
+    srcs = [
+        "mobilenet_v1_0.25_224_int8_dummy_cc",
+        "run_mobilenet_1x1_v1_dummy.cc",
+    ],
+    hdrs = ["mobilenet_v1_0.25_224_int8_dummy.h"],
+    dtcm_size_kbytes = 1024,  # Highmem
+    itcm_size_kbytes = 1024,  # Highmem
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tape_out/sw/opt/litert-micro:conv_1x1",
+        "//sw/opt/litert-micro:depthwise_conv",
+        "@tflite_micro//tensorflow/lite/micro:micro_framework",
+        "@tflite_micro//tensorflow/lite/micro:micro_log",
+        "@tflite_micro//tensorflow/lite/micro:micro_profiler",
+        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
+        "@tflite_micro//tensorflow/lite/micro:system_setup",
+    ],
+)
+
+generate_cc_arrays(
+    name = "mobilenet_v1_0.25_224_int8_dummy_cc",
+    src = "models/mobilenet_v1_0.25_224_int8_dummy.tflite",
+    out = "mobilenet_v1_0.25_224_int8_dummy.cc",
+)
+
+generate_cc_arrays(
+    name = "mobilenet_v1_0.25_224_int8_dummy_h",
+    src = "models/mobilenet_v1_0.25_224_int8_dummy.tflite",
+    out = "mobilenet_v1_0.25_224_int8_dummy.h",
+)
+
+cocotb_test_suite(
+    name = "cocotb_run_mobilenet_1x1_v1_dummy",
+    simulators = [
+        "verilator",
+        "vcs",
+    ],
+    testcases = RUN_MOBILENET_TEST,
+    testcases_vname = "RUN_MOBILENET_TEST",
+    tests_kwargs = {
+        "waves": False,
+        "tags": ["manual"],
+        "hdl_toplevel": "RvvCoreMiniHighmemAxi",
+        "seed": "42",
+        "size": "enormous",
+        "test_module": ["cocotb_run_mobilenet_1x1_v1_dummy.py"],
+        "deps": [
+            "//coralnpu_test_utils:core_mini_axi_sim_interface",
+            "//coralnpu_test_utils:sim_test_fixture",
+            "@rules_python//python/runfiles",
+        ],
+        "data": ["run_mobilenet_1x1_v1_dummy_binary.elf"],
     },
     vcs_build_args = VCS_BUILD_ARGS,
     vcs_data = glob(["**/*.elf"]) + [

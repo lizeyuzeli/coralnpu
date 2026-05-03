@@ -78,6 +78,41 @@ generate_cc_arrays(
     out = "mobilenet_v1_025_partial_layers.h",
 )
 
+coralnpu_v2_binary(
+    name = "run_mobilenet_1x1_v1_binary",
+    srcs = [
+        "mobilenet-v1-tflite-1-0-224-quantized-metadata-v1_cc",
+        "sw/run_mobilenet_1x1_partial_layers.cc",
+    ],
+    copts = ["-DCLOCK_FREQUENCY_MHZ=" + _CLOCK_FREQUENCY_MHZ],
+    hdrs = ["mobilenet-v1-tflite-1-0-224-quantized-metadata-v1.h"],
+    dtcm_size_kbytes = 1024,  # Highmem
+    itcm_size_kbytes = 1024,  # Highmem
+    visibility = ["//visibility:public"],
+    deps = [
+        "//tape_out/sw/opt/litert-micro:conv_1x1",
+        "//sw/opt/litert-micro:depthwise_conv",
+        "@tflite_micro//tensorflow/lite/micro:micro_framework",
+        "@tflite_micro//tensorflow/lite/micro:micro_log",
+        "@tflite_micro//tensorflow/lite/micro:micro_profiler",
+        "@tflite_micro//tensorflow/lite/micro:op_resolvers",
+        "@tflite_micro//tensorflow/lite/micro:system_setup",
+        "//fpga:uart",
+    ],
+)
+
+generate_cc_arrays(
+    name = "mobilenet-v1-tflite-1-0-224-quantized-metadata-v1_cc",
+    src = "sw/models/mobilenet-v1-tflite-1-0-224-quantized-metadata-v1.tflite",
+    out = "mobilenet-v1-tflite-1-0-224-quantized-metadata-v1.cc",
+)
+
+generate_cc_arrays(
+    name = "mobilenet-v1-tflite-1-0-224-quantized-metadata-v1_h",
+    src = "sw/models/mobilenet-v1-tflite-1-0-224-quantized-metadata-v1.tflite",
+    out = "mobilenet-v1-tflite-1-0-224-quantized-metadata-v1.h",
+)
+
 CORALNPU_SOC_CORES = [
     "//fpga:coralnpu_soc.core",
     "//fpga:coralnpu_soc_pkg.core",
