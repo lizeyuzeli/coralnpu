@@ -20,7 +20,7 @@ from coralnpu_test_utils.sim_test_fixture import Fixture
 
 
 def tolerate(target: int, tolerance = 1.2) -> int:
-    return int(target * tolerance)
+    return int(target * tolerance * 20)  # 20x: LVDS-bridged Core_Axi_Chip is slower per memory access
 
 
 class Conv2DTest:
@@ -30,14 +30,14 @@ class Conv2DTest:
         in_h = out_h * stride
         in_w = out_w * stride
         self.in_shape = np.array([1, in_h, in_w, in_d], dtype=np.uint32)
-        self.f_shape = np.array([out_d, 1, 1, in_d], dtype=np.uint32)
+        self.f_shape = np.array([out_d, 4, 4, in_d], dtype=np.uint32)
         self.bias_shape = np.array([out_d], dtype=np.uint32)
         self.out_shape = np.array([1, out_h, out_w, out_d], dtype=np.uint32)
         self.out_size = int(np.prod(self.out_shape))
 
         r = runfiles.Create()
         self.elf_file = r.Rlocation(
-            'coralnpu_hw/tape_out/tests/cocotb/tutorial/tfmicro/conv2d_1x1_test.elf')
+            'coralnpu_hw/tape_out/tests/cocotb/tutorial/tfmicro/conv2d_test.elf')
         self.fixture = None
 
     async def load_and_populate_input(self, dut):
@@ -107,7 +107,86 @@ class Conv2DTest:
 # slower than `-c opt` because DCHECKs are enabled.
 
 @cocotb.test()
-async def test_conv2d_1x1_48x48_h2w2(dut):
-    t = Conv2DTest(in_d=48, out_d=48, out_h=4, out_w=4)
+async def test_conv2d_4x1_h2w2(dut):
+    t = Conv2DTest(in_d=4, out_d=1, out_h=2, out_w=2)
     await t.load_and_populate_input(dut)
-    await t.test(ref_target=275_7000, opt_target=275_700)
+    await t.test(ref_target=4500, opt_target=4800)
+
+
+@cocotb.test()
+async def test_conv2d_9x2(dut):
+    t = Conv2DTest(in_d=9, out_d=2)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=77_959, opt_target=14_000)
+
+@cocotb.test()
+async def test_conv2d_16x1(dut):
+    t = Conv2DTest(in_d=16, out_d=1)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=58_600, opt_target=9_700)
+
+@cocotb.test()
+async def test_conv2d_16x3_s2(dut):
+    t = Conv2DTest(in_d=16, out_d=3, stride=2)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=241_454, opt_target=31_600)
+
+# A case to fall back.
+@cocotb.test()
+async def test_conv2d_18x1(dut):
+    t = Conv2DTest(in_d=18, out_d=1)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=63_700, opt_target=13_600)
+
+
+@cocotb.test()
+async def test_conv2d_16x16(dut):
+    t = Conv2DTest(in_d=16, out_d=16)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=913_600, opt_target=80_000)
+
+
+@cocotb.test()
+async def test_conv2d_16x16_h2w8(dut):
+    t = Conv2DTest(in_d=16, out_d=16, out_h=2, out_w=8)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=747_900, opt_target=63_900)
+
+@cocotb.test()
+async def test_conv2d_37x1_h2w2(dut):
+    t = Conv2DTest(in_d=37, out_d=1, out_h=2, out_w=2)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=14_843, opt_target=7_451)
+
+@cocotb.test()
+async def test_conv2d_21x48_h8w8(dut):
+    t = Conv2DTest(in_d=21, out_d=48, out_h=2, out_w=2)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=438_440, opt_target=131_568)
+
+@cocotb.test()
+async def test_conv2d_48x2(dut):
+    t = Conv2DTest(in_d=48, out_d=2)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=290_516, opt_target=31_827)
+
+
+# Skipping large tests to reduce over head on pre-submit test :test_coralnpu
+
+@cocotb.test(skip=True)
+async def test_conv2d_16x4_h8w8_s2(dut):
+    t = Conv2DTest(stride=2, in_d=16, out_d=4, out_h=8, out_w=8)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=3_190_900, opt_target=1_00_000)
+
+@cocotb.test(skip=True)
+async def test_conv2d_48x48_h2w2(dut):
+    t = Conv2DTest(in_d=48, out_d=48, out_h=2, out_w=2)
+    await t.load_and_populate_input(dut)
+    await t.test_opt(opt_target=275_700)
+
+@cocotb.test(skip=True)
+async def test_conv2d_16x4_h8w8(dut):
+    t = Conv2DTest(in_d=16, out_d=4, out_h=8, out_w=8)
+    await t.load_and_populate_input(dut)
+    await t.test(ref_target=599_081, opt_target=25_009)
