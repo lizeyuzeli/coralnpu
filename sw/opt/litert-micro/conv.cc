@@ -428,6 +428,370 @@ void Conv2D_4x4(const tflite::ConvParams& params,
   }
 }
 
+// Vectorized 1x1 (pointwise) Conv2D kernel with LMUL=4 over output channels.
+// Repacked weight layout: [ic][oc] (kernel is 1x1 so no ky/kx dimension).
+// Quantization is bit-identical to Conv2D_4x4.
+void Conv2D_1x1(const tflite::ConvParams& params,
+                const coralnpu_v2::opt::litert_micro::OpDataConvCustom& data,
+                const tflite::RuntimeShape& input_shape,
+                const int8_t* input_data,
+                const tflite::RuntimeShape& filter_shape,
+                const int8_t* filter_data, const int32_t* bias_data,
+                const tflite::RuntimeShape& output_shape, int8_t* output_data,
+                const int8_t* repacked_weights) {
+  const int stride_width = params.stride_width;
+  const int stride_height = params.stride_height;
+  const int pad_width = params.padding_values.width;
+  const int pad_height = params.padding_values.height;
+  const int32_t input_offset = params.input_offset;
+  const int32_t output_offset = params.output_offset;
+
+  const int batches = input_shape.Dims(0);
+  const int input_height = input_shape.Dims(1);
+  const int input_width = input_shape.Dims(2);
+  const int input_depth = input_shape.Dims(3);
+
+  const int output_height = output_shape.Dims(1);
+  const int output_width = output_shape.Dims(2);
+  const int output_depth = filter_shape.Dims(0);
+
+  for (int out_channel_start = 0; out_channel_start < output_depth;) {
+    int rem = output_depth - out_channel_start;
+    size_t vl = __riscv_vsetvl_e32m4(rem);  // LMUL=4
+
+    // Preload bias / per-channel quant params.
+    vint32m4_t bias_v =
+        __riscv_vle32_v_i32m4(bias_data + out_channel_start, vl);
+    vint32m4_t mult_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_multiplier + out_channel_start, vl);
+    vint32m4_t shift_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_shift + out_channel_start, vl);
+
+    vint32m4_t left_shift_v = __riscv_vmax_vx_i32m4(shift_v, 0, vl);
+    vint32m4_t right_shift_v =
+        __riscv_vmax_vx_i32m4(__riscv_vneg_v_i32m4(shift_v, vl), 0, vl);
+    vint32m4_t shift_minus_1_v = __riscv_vsub_vx_i32m4(right_shift_v, 1, vl);
+    vbool8_t mask_gt0 = __riscv_vmsgt_vx_i32m4_b8(right_shift_v, 0, vl);
+    vint32m4_t nudge_v = __riscv_vmv_v_x_i32m4(0, vl);
+    nudge_v = __riscv_vsll_vv_i32m4_mu(
+        mask_gt0, nudge_v, __riscv_vmv_v_x_i32m4(1, vl),
+        __riscv_vreinterpret_v_i32m4_u32m4(shift_minus_1_v), vl);
+
+    for (int batch = 0; batch < batches; ++batch) {
+      const int8_t* batch_base =
+          input_data + batch * input_height * input_width * input_depth;
+      for (int out_y = 0; out_y < output_height; ++out_y) {
+        const int in_y = (out_y * stride_height) - pad_height;
+        const bool y_in =
+            (static_cast<unsigned>(in_y) < static_cast<unsigned>(input_height));
+        for (int out_x = 0; out_x < output_width; ++out_x) {
+          const int in_x = (out_x * stride_width) - pad_width;
+          const bool x_in = (static_cast<unsigned>(in_x) <
+                             static_cast<unsigned>(input_width));
+
+          vint32m4_t acc = bias_v;
+          if (y_in && x_in) {
+            const int8_t* in_ptr =
+                batch_base + (in_y * input_width + in_x) * input_depth;
+            // Weight layout: [ic][oc], with oc contiguous along vl.
+            const int8_t* w_ptr = repacked_weights + out_channel_start;
+            for (int ic = 0; ic < input_depth; ++ic) {
+              vint8m1_t w = __riscv_vle8_v_i8m1(w_ptr, vl);
+              vint16m2_t w16 = __riscv_vwadd_vx_i16m2(w, 0, vl);
+              int16_t v = static_cast<int16_t>(in_ptr[ic] + input_offset);
+              acc = __riscv_vwmacc_vx_i32m4(acc, v, w16, vl);
+              w_ptr += output_depth;
+            }
+          }
+
+          // Quantize and store.
+          acc = __riscv_vsll_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(left_shift_v), vl);
+          acc = __riscv_vsmul_vv_i32m4(acc, mult_v, 0, vl);
+          acc = __riscv_vadd_vv_i32m4(acc, nudge_v, vl);
+          acc = __riscv_vsra_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(right_shift_v), vl);
+          acc = __riscv_vadd_vx_i32m4(acc, output_offset, vl);
+          acc = __riscv_vmax_vx_i32m4(acc, data.output_activation_min, vl);
+          acc = __riscv_vmin_vx_i32m4(acc, data.output_activation_max, vl);
+          vint16m2_t a16 = __riscv_vnclip_wx_i16m2(acc, 0, 0, vl);
+          vint8m1_t a8 = __riscv_vnclip_wx_i8m1(a16, 0, 0, vl);
+          int8_t* out_ptr =
+              output_data +
+              ((batch * output_height + out_y) * output_width + out_x) *
+                  output_depth +
+              out_channel_start;
+          __riscv_vse8_v_i8m1(out_ptr, a8, vl);
+        }
+      }
+    }
+    out_channel_start += vl;
+  }
+}
+
+// Vectorized 3x3 Conv2D kernel with LMUL=4 over output channels.
+// Repacked weight layout: [ky][kx][ic][oc].
+// Uses PadInput for branchless boundary access. Quantization is bit-identical
+// to Conv2D_4x4.
+void Conv2D_3x3(const tflite::ConvParams& params,
+                const coralnpu_v2::opt::litert_micro::OpDataConvCustom& data,
+                const tflite::RuntimeShape& input_shape,
+                const int8_t* input_data,
+                const tflite::RuntimeShape& filter_shape,
+                const int8_t* filter_data, const int32_t* bias_data,
+                const tflite::RuntimeShape& output_shape, int8_t* output_data,
+                const int8_t* repacked_weights, TfLiteContext* context) {
+  const int stride_width = params.stride_width;
+  const int stride_height = params.stride_height;
+  const int dilation_width_factor = params.dilation_width_factor;
+  const int dilation_height_factor = params.dilation_height_factor;
+  const int pad_width = params.padding_values.width;
+  const int pad_height = params.padding_values.height;
+  const int32_t input_offset = params.input_offset;
+  const int32_t output_offset = params.output_offset;
+
+  const int batches = input_shape.Dims(0);
+  const int input_height = input_shape.Dims(1);
+  const int input_width = input_shape.Dims(2);
+  const int input_depth = input_shape.Dims(3);
+
+  constexpr int kKH = 3;
+  constexpr int kKW = 3;
+  const int output_depth = filter_shape.Dims(0);
+  const int output_height = output_shape.Dims(1);
+  const int output_width = output_shape.Dims(2);
+
+  int8_t* generic_tiled_buffer =
+      (data.generic_tiled_buffer_index != -1)
+          ? static_cast<int8_t*>(context->GetScratchBuffer(
+                context, data.generic_tiled_buffer_index))
+          : nullptr;
+
+  for (int out_channel_start = 0; out_channel_start < output_depth;) {
+    int rem = output_depth - out_channel_start;
+    size_t vl = __riscv_vsetvl_e32m4(rem);  // LMUL=4
+
+    vint32m4_t bias_v =
+        __riscv_vle32_v_i32m4(bias_data + out_channel_start, vl);
+    vint32m4_t mult_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_multiplier + out_channel_start, vl);
+    vint32m4_t shift_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_shift + out_channel_start, vl);
+
+    vint32m4_t left_shift_v = __riscv_vmax_vx_i32m4(shift_v, 0, vl);
+    vint32m4_t right_shift_v =
+        __riscv_vmax_vx_i32m4(__riscv_vneg_v_i32m4(shift_v, vl), 0, vl);
+    vint32m4_t shift_minus_1_v = __riscv_vsub_vx_i32m4(right_shift_v, 1, vl);
+    vbool8_t mask_gt0 = __riscv_vmsgt_vx_i32m4_b8(right_shift_v, 0, vl);
+    vint32m4_t nudge_v = __riscv_vmv_v_x_i32m4(0, vl);
+    nudge_v = __riscv_vsll_vv_i32m4_mu(
+        mask_gt0, nudge_v, __riscv_vmv_v_x_i32m4(1, vl),
+        __riscv_vreinterpret_v_i32m4_u32m4(shift_minus_1_v), vl);
+
+    for (int batch = 0; batch < batches; ++batch) {
+      const int8_t* batch_base =
+          input_data + batch * input_height * input_width * input_depth;
+      const int8_t* padded_input_base = nullptr;
+      if (generic_tiled_buffer) {
+        padded_input_base =
+            PadInput(generic_tiled_buffer, batch_base, input_height,
+                     input_width, input_depth, params.input_offset, 0, 0, 0, 0);
+      }
+
+      const int pad_bytes = kPadPixel * input_depth;
+      const int stride_padded = (input_width * input_depth) + 2 * pad_bytes;
+
+      for (int out_y = 0; out_y < output_height; ++out_y) {
+        const int in_y_origin = (out_y * stride_height) - pad_height;
+        for (int out_x = 0; out_x < output_width; ++out_x) {
+          const int in_x_origin = (out_x * stride_width) - pad_width;
+          vint32m4_t acc = bias_v;
+
+          for (int ky = 0; ky < kKH; ++ky) {
+            const int in_y = in_y_origin + dilation_height_factor * ky;
+            if (in_y < 0 || in_y >= input_height) continue;
+
+            const int8_t* pad_row =
+                padded_input_base
+                    ? (padded_input_base + in_y * stride_padded)
+                    : nullptr;
+            const int8_t* val_row =
+                batch_base + (in_y * input_width * input_depth);
+
+            for (int kx = 0; kx < kKW; ++kx) {
+              const int in_x = in_x_origin + dilation_width_factor * kx;
+              // Repacked weight block for (ky,kx): [ic][oc], oc contiguous.
+              const int8_t* w_block =
+                  repacked_weights +
+                  ((ky * kKW + kx) * input_depth * output_depth) +
+                  out_channel_start;
+
+              if (pad_row) {
+                // Branchless: padded buffer fills OOB with -input_offset so
+                // (val + input_offset) becomes 0.
+                const int8_t* in_ptr = pad_row + in_x * input_depth;
+                for (int ic = 0; ic < input_depth; ++ic) {
+                  vint8m1_t w =
+                      __riscv_vle8_v_i8m1(w_block + ic * output_depth, vl);
+                  vint16m2_t w16 = __riscv_vwadd_vx_i16m2(w, 0, vl);
+                  int16_t v = static_cast<int16_t>(in_ptr[ic] + input_offset);
+                  acc = __riscv_vwmacc_vx_i32m4(acc, v, w16, vl);
+                }
+              } else {
+                if (in_x < 0 || in_x >= input_width) continue;
+                const int8_t* in_ptr = val_row + in_x * input_depth;
+                for (int ic = 0; ic < input_depth; ++ic) {
+                  vint8m1_t w =
+                      __riscv_vle8_v_i8m1(w_block + ic * output_depth, vl);
+                  vint16m2_t w16 = __riscv_vwadd_vx_i16m2(w, 0, vl);
+                  int16_t v = static_cast<int16_t>(in_ptr[ic] + input_offset);
+                  acc = __riscv_vwmacc_vx_i32m4(acc, v, w16, vl);
+                }
+              }
+            }
+          }
+
+          // Quantize and store (identical to Conv2D_4x4 / Conv2D_1x1).
+          acc = __riscv_vsll_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(left_shift_v), vl);
+          acc = __riscv_vsmul_vv_i32m4(acc, mult_v, 0, vl);
+          acc = __riscv_vadd_vv_i32m4(acc, nudge_v, vl);
+          acc = __riscv_vsra_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(right_shift_v), vl);
+          acc = __riscv_vadd_vx_i32m4(acc, output_offset, vl);
+          acc = __riscv_vmax_vx_i32m4(acc, data.output_activation_min, vl);
+          acc = __riscv_vmin_vx_i32m4(acc, data.output_activation_max, vl);
+          vint16m2_t a16 = __riscv_vnclip_wx_i16m2(acc, 0, 0, vl);
+          vint8m1_t a8 = __riscv_vnclip_wx_i8m1(a16, 0, 0, vl);
+          int8_t* out_ptr =
+              output_data +
+              ((batch * output_height + out_y) * output_width + out_x) *
+                  output_depth +
+              out_channel_start;
+          __riscv_vse8_v_i8m1(out_ptr, a8, vl);
+        }
+      }
+    }
+    out_channel_start += vl;
+  }
+}
+
+// Vectorized Conv2D kernel for arbitrary (kH, kW) with LMUL=4 over output
+// channels. Repacked weight layout: [ky][kx][ic][oc] (same as 3x3 / 4x4).
+// No padded tile buffer is used: spatial bounds are checked per (ky, kx),
+// which keeps the kernel general (e.g. KWS-MicroNet's 10x4 stem) at the cost
+// of one branch per spatial position. Quantization is bit-identical to
+// Conv2D_4x4 / Conv2D_3x3 / Conv2D_1x1.
+void Conv2D_Generic(const tflite::ConvParams& params,
+                    const coralnpu_v2::opt::litert_micro::OpDataConvCustom& data,
+                    const tflite::RuntimeShape& input_shape,
+                    const int8_t* input_data,
+                    const tflite::RuntimeShape& filter_shape,
+                    const int8_t* filter_data, const int32_t* bias_data,
+                    const tflite::RuntimeShape& output_shape,
+                    int8_t* output_data, const int8_t* repacked_weights) {
+  const int stride_width = params.stride_width;
+  const int stride_height = params.stride_height;
+  const int dilation_width_factor = params.dilation_width_factor;
+  const int dilation_height_factor = params.dilation_height_factor;
+  const int pad_width = params.padding_values.width;
+  const int pad_height = params.padding_values.height;
+  const int32_t input_offset = params.input_offset;
+  const int32_t output_offset = params.output_offset;
+
+  const int batches = input_shape.Dims(0);
+  const int input_height = input_shape.Dims(1);
+  const int input_width = input_shape.Dims(2);
+  const int input_depth = input_shape.Dims(3);
+
+  const int filter_height = filter_shape.Dims(1);
+  const int filter_width = filter_shape.Dims(2);
+  const int output_depth = filter_shape.Dims(0);
+  const int output_height = output_shape.Dims(1);
+  const int output_width = output_shape.Dims(2);
+
+  for (int out_channel_start = 0; out_channel_start < output_depth;) {
+    int rem = output_depth - out_channel_start;
+    size_t vl = __riscv_vsetvl_e32m4(rem);  // LMUL=4
+
+    vint32m4_t bias_v =
+        __riscv_vle32_v_i32m4(bias_data + out_channel_start, vl);
+    vint32m4_t mult_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_multiplier + out_channel_start, vl);
+    vint32m4_t shift_v = __riscv_vle32_v_i32m4(
+        data.per_channel_output_shift + out_channel_start, vl);
+
+    vint32m4_t left_shift_v = __riscv_vmax_vx_i32m4(shift_v, 0, vl);
+    vint32m4_t right_shift_v =
+        __riscv_vmax_vx_i32m4(__riscv_vneg_v_i32m4(shift_v, vl), 0, vl);
+    vint32m4_t shift_minus_1_v = __riscv_vsub_vx_i32m4(right_shift_v, 1, vl);
+    vbool8_t mask_gt0 = __riscv_vmsgt_vx_i32m4_b8(right_shift_v, 0, vl);
+    vint32m4_t nudge_v = __riscv_vmv_v_x_i32m4(0, vl);
+    nudge_v = __riscv_vsll_vv_i32m4_mu(
+        mask_gt0, nudge_v, __riscv_vmv_v_x_i32m4(1, vl),
+        __riscv_vreinterpret_v_i32m4_u32m4(shift_minus_1_v), vl);
+
+    for (int batch = 0; batch < batches; ++batch) {
+      const int8_t* batch_base =
+          input_data + batch * input_height * input_width * input_depth;
+
+      for (int out_y = 0; out_y < output_height; ++out_y) {
+        const int in_y_origin = (out_y * stride_height) - pad_height;
+        for (int out_x = 0; out_x < output_width; ++out_x) {
+          const int in_x_origin = (out_x * stride_width) - pad_width;
+          vint32m4_t acc = bias_v;
+
+          for (int ky = 0; ky < filter_height; ++ky) {
+            const int in_y = in_y_origin + dilation_height_factor * ky;
+            if (in_y < 0 || in_y >= input_height) continue;
+            const int8_t* val_row =
+                batch_base + (in_y * input_width * input_depth);
+
+            for (int kx = 0; kx < filter_width; ++kx) {
+              const int in_x = in_x_origin + dilation_width_factor * kx;
+              if (in_x < 0 || in_x >= input_width) continue;
+
+              // Repacked weight block for (ky,kx): [ic][oc], oc contiguous.
+              const int8_t* w_block =
+                  repacked_weights +
+                  ((ky * filter_width + kx) * input_depth * output_depth) +
+                  out_channel_start;
+              const int8_t* in_ptr = val_row + in_x * input_depth;
+              for (int ic = 0; ic < input_depth; ++ic) {
+                vint8m1_t w =
+                    __riscv_vle8_v_i8m1(w_block + ic * output_depth, vl);
+                vint16m2_t w16 = __riscv_vwadd_vx_i16m2(w, 0, vl);
+                int16_t v = static_cast<int16_t>(in_ptr[ic] + input_offset);
+                acc = __riscv_vwmacc_vx_i32m4(acc, v, w16, vl);
+              }
+            }
+          }
+
+          // Quantize and store (identical to Conv2D_4x4 / Conv2D_3x3).
+          acc = __riscv_vsll_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(left_shift_v), vl);
+          acc = __riscv_vsmul_vv_i32m4(acc, mult_v, 0, vl);
+          acc = __riscv_vadd_vv_i32m4(acc, nudge_v, vl);
+          acc = __riscv_vsra_vv_i32m4(
+              acc, __riscv_vreinterpret_v_i32m4_u32m4(right_shift_v), vl);
+          acc = __riscv_vadd_vx_i32m4(acc, output_offset, vl);
+          acc = __riscv_vmax_vx_i32m4(acc, data.output_activation_min, vl);
+          acc = __riscv_vmin_vx_i32m4(acc, data.output_activation_max, vl);
+          vint16m2_t a16 = __riscv_vnclip_wx_i16m2(acc, 0, 0, vl);
+          vint8m1_t a8 = __riscv_vnclip_wx_i8m1(a16, 0, 0, vl);
+          int8_t* out_ptr =
+              output_data +
+              ((batch * output_height + out_y) * output_width + out_x) *
+                  output_depth +
+              out_channel_start;
+          __riscv_vse8_v_i8m1(out_ptr, a8, vl);
+        }
+      }
+    }
+    out_channel_start += vl;
+  }
+}
+
 void Conv_4_4_16_StrideN(
     const ConvParams& params, const OpDataConvCustom& data,
     const int32_t* output_multiplier, const uint8_t* shift_left,
@@ -1291,7 +1655,17 @@ void ConvPerChannel(const ConvParams& params, const OpDataConvCustom& data,
   PrepareShiftParams(shift_left.get(), shift_right.get(), output_shift,
                      output_depth);
 
-  if (filter_height == 4 && filter_width == 4 && (input_depth % 4 == 0) &&
+  if (filter_height == 1 && filter_width == 1 &&
+      data.repacked_weights_generic != nullptr) {
+    Conv2D_1x1(params, data, input_shape, input_data, filter_shape,
+               filter_data_copy.get(), bias_data_copy.get(), output_shape,
+               output_data, data.repacked_weights_generic);
+  } else if (filter_height == 3 && filter_width == 3 &&
+             data.repacked_weights_generic != nullptr) {
+    Conv2D_3x3(params, data, input_shape, input_data, filter_shape,
+               filter_data_copy.get(), bias_data_copy.get(), output_shape,
+               output_data, data.repacked_weights_generic, context);
+  } else if (filter_height == 4 && filter_width == 4 && (input_depth % 4 == 0) &&
       data.repacked_weights != nullptr) {
     int8_t* tiled_buffer = static_cast<int8_t*>(
         context->GetScratchBuffer(context, data.tiled_input_buffer_index));
@@ -1321,6 +1695,12 @@ void ConvPerChannel(const ConvParams& params, const OpDataConvCustom& data,
     Conv2D_4x4(params, data, input_shape, input_data, filter_shape,
                filter_data_copy.get(), bias_data_copy.get(), output_shape,
                output_data, data.repacked_weights_generic, context);
+  } else if (data.repacked_weights_generic != nullptr) {
+    // Generic OC-vectorized fallback: any (kH, kW) for which we successfully
+    // pre-built the [ky][kx][ic][oc] repacked weights in Prepare.
+    Conv2D_Generic(params, data, input_shape, input_data, filter_shape,
+                   filter_data_copy.get(), bias_data_copy.get(), output_shape,
+                   output_data, data.repacked_weights_generic);
   } else {
     MicroPrintf("Fallback kernel: fh=%d fw=%d id=%d od=%d", filter_height,
                 filter_width, input_depth, output_depth);
@@ -1422,8 +1802,13 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
   const int filter_height = filter->dims->data[1];
   const int filter_width = filter->dims->data[2];
 
-  if (filter_height == 4 && filter_width == 4) {
-    // Check for 4x4 optimization opportunity (Generic)
+  // Generic repacked weights ([ky][kx][ic][oc]) are used by the optimized
+  // 1x1 / 3x3 / 4x4 kernels and by the Conv2D_Generic OC-vectorized fallback
+  // for arbitrary (kH, kW) (e.g. KWS-MicroNet's 10x4 stem). 1x1 does not need
+  // the padded tile buffer (no spatial accesses); 3x3 and 4x4 do; the generic
+  // fallback uses bounds-checked direct loads and also doesn't need it.
+  const bool wants_generic_repack = filter_height >= 1 && filter_width >= 1;
+  if (wants_generic_repack) {
     size_t repacked_size =
         output_depth * filter_height * filter_width * input_depth;
     data->repacked_weights_generic = static_cast<int8_t*>(
@@ -1444,8 +1829,16 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
         }
       }
     }
-    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, kInputBufferSize, &data->generic_tiled_buffer_index));
+    // Padded tile buffer is only used by Conv2D_3x3 and Conv2D_4x4. 1x1 has
+    // no spatial accesses; the generic OC-vectorized fallback does its own
+    // bounds checks and doesn't read the padded tile.
+    const bool wants_padded_tile =
+        (filter_height == 3 && filter_width == 3) ||
+        (filter_height == 4 && filter_width == 4);
+    if (wants_padded_tile) {
+      TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+          context, kInputBufferSize, &data->generic_tiled_buffer_index));
+    }
   }
 
   if (filter_height == 4 && filter_width == 4 && (input_depth % 4 == 0) &&
