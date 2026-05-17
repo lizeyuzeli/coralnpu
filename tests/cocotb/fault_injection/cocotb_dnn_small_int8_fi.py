@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 Li Zeyu <lizeyuzeli000lzy@gmail.com>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ from coralnpu_test_utils.sim_test_fixture import Fixture
 import fi_utils
 
 
-_RUNFILES_PREFIX = "coralnpu_hw/tests/cocotb/tflite/dnn_small_int8/"
+_RUNFILES_PREFIX = "coralnpu_hw/tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8/"
 _ELF = "run_dnn_small_int8_binary.elf"
 _INPUT_NPY = "test_data/input_0.npy"
 _EXPECTED_NPY = "test_data/expected_output_0.npy"

@@ -19,7 +19,7 @@ work on the RVV core (VRF ECC / ROB protection / pipeline parity, etc.).
 | `cocotb_dnn_small_int8_fi.py` | Top-level cocotb test. Orchestrates golden + N injected inferences, writes `fi_results.csv`. |
 | `BUILD` | Bazel `cocotb_test_suite` target. Currently uses the existing `rvv_core_mini_highmem_axi_model` Verilator build. |
 | `../../../rules/default.vlt.tpl` | Verilator config that exposes the targeted internal signals as `public_flat_rw` so they can be deposited via VPI. |
-| `../tflite/dnn_small_int8/BUILD` | Reused upstream: provides the test ELF + reference IO `.npy` files. |
+| `../tflite/arm_ml_zoo/dnn_small_int8/BUILD` | Reused upstream: provides the test ELF + reference IO `.npy` files. |
 
 ---
 

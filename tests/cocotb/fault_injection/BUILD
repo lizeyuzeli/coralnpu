@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 Li Zeyu <lizeyuzeli000lzy@gmail.com>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 # Phase-1 fault-injection campaign on the DNN-Small INT8 inference test.
 # Reuses the ELF + reference IO arrays produced by //tests/cocotb/tflite/
-# dnn_small_int8 and adds a cocotb test that performs single-bit transient
+# arm_ml_zoo/dnn_small_int8 and adds a cocotb test that performs single-bit transient
 # flips of the RVV vector register file.
 
 load("//rules:coco_tb.bzl", "cocotb_test_suite")
@@ -63,16 +63,16 @@ cocotb_test_suite(
             "@rules_python//python/runfiles",
         ],
         "data": [
-            "//tests/cocotb/tflite/dnn_small_int8:run_dnn_small_int8_binary_elf_public",
-            "//tests/cocotb/tflite/dnn_small_int8:test_data/input_0.npy",
-            "//tests/cocotb/tflite/dnn_small_int8:test_data/expected_output_0.npy",
+            "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:run_dnn_small_int8_binary_elf_public",
+            "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:test_data/input_0.npy",
+            "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:test_data/expected_output_0.npy",
         ],
     },
     vcs_build_args = VCS_BUILD_ARGS,
     vcs_data = VCS_COMMON_DATA + [
-        "//tests/cocotb/tflite/dnn_small_int8:run_dnn_small_int8_binary_elf_public",
-        "//tests/cocotb/tflite/dnn_small_int8:test_data/input_0.npy",
-        "//tests/cocotb/tflite/dnn_small_int8:test_data/expected_output_0.npy",
+        "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:run_dnn_small_int8_binary_elf_public",
+        "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:test_data/input_0.npy",
+        "//tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8:test_data/expected_output_0.npy",
     ],
     vcs_defines = VCS_DEFINES,
     vcs_test_args = VCS_TEST_ARGS,
