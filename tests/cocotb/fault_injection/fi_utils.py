@@ -41,43 +41,67 @@ _RVV_BACKEND_PREFIX = ("core", "rvvCore", "rvvCoreWrapper", "core", "backend")
 # tree (`path` is a tuple of attribute names from `dut`), the leaf signal
 # name, a short description, and an optional "row width" used to slice the
 # packed vector into logical entries (e.g. NUM_VRF rows of VLEN bits).
+# Each entry now carries two taxonomy axes used by the campaign driver:
+#   class: data | control | mixed
+#       Identifies what kind of state the bits represent. Drives the
+#       core paper plot ("data SEUs are mostly MASKED, control SEUs are
+#       almost always CRASH/HANG") and lets `FI_TARGET` accept a class
+#       name to sweep all targets of one kind.
+#   group: vrf | rob | mac | alu | div
+#       Functional unit / module the target lives in. Used as a sweep key
+#       for `FI_TARGET=<group>` and as a CSV column for unit-level
+#       breakdowns.
+# `default_class` (soft|hard) is the natural fault class for the target;
+# storage and pipeline FFs default to `soft` (SEU). Switch to hard via
+# `FI_FAULT_CLASS=hard` to model permanent stuck-at on the same target.
 TARGETS = {
     "vrf_storage": {
         "path": _RVV_BACKEND_PREFIX + ("u_vrf", "vrf_reg"),
         "signal": "vreg",
         "row_bits": 128,  # VLEN; vreg is [NUM_VRF-1:0][VLEN-1:0]
-        "fault_model": "persistent",  # storage cell -> SEU stays
+        "class": "data",
+        "group": "vrf",
+        "default_class": "soft",
         "description": "RVV vector register file storage (NUM_VRF x VLEN)",
     },
     "rob_uop_done": {
         "path": _RVV_BACKEND_PREFIX + ("u_rob",),
         "signal": "uop_done",
         "row_bits": 1,
-        "fault_model": "persistent",
+        "class": "control",
+        "group": "rob",
+        "default_class": "soft",
         "description": "ROB per-entry completion bit",
     },
     "rob_trap_flag": {
         "path": _RVV_BACKEND_PREFIX + ("u_rob",),
         "signal": "trap_flag",
         "row_bits": 1,
-        "fault_model": "persistent",
+        "class": "control",
+        "group": "rob",
+        "default_class": "soft",
         "description": "ROB per-entry trap flag",
     },
     "rob_entry_valid": {
         "path": _RVV_BACKEND_PREFIX + ("u_rob",),
         "signal": "entry_valid",
         "row_bits": 1,
-        "fault_model": "persistent",
+        "class": "control",
+        "group": "rob",
+        "default_class": "soft",
         "description": "ROB per-entry valid bit",
     },
-    # MAC unit pipeline registers (INST_MAC[0]). NUM_MUL=2 so a symmetric
-    # lane [1] entry could be added later; for now we only target lane 0.
+    # MAC unit pipeline registers. NUM_MUL=2; both lanes are catalogued
+    # so the hard-fault campaign can pick a single lane to permanently
+    # disable.
     "mac0_addsrc_d1": {
         "path": _RVV_BACKEND_PREFIX + (
             "u_mulmac", "INST_MAC", 0, "u_mac", "u_addsrc_delay"),
         "signal": "q",
         "row_bits": 8,  # treat as byte rows for reporting
-        "fault_model": "persistent",
+        "class": "data",
+        "group": "mac",
+        "default_class": "soft",
         "description": "MAC lane 0: VLEN-wide accumulator-add source D1 register",
     },
     "mac0_rob_entry_d1": {
@@ -85,7 +109,9 @@ TARGETS = {
             "u_mulmac", "INST_MAC", 0, "u_mac", "u_rob_entry_delay"),
         "signal": "q",
         "row_bits": 1,  # ROB_DEPTH_WIDTH-bit critical control pointer
-        "fault_model": "persistent",
+        "class": "control",
+        "group": "mac",
+        "default_class": "soft",
         "description": "MAC lane 0: which ROB entry to write back into (control)",
     },
     "mac1_addsrc_d1": {
@@ -93,7 +119,9 @@ TARGETS = {
             "u_mulmac", "INST_MAC", 1, "u_mac", "u_addsrc_delay"),
         "signal": "q",
         "row_bits": 8,
-        "fault_model": "persistent",
+        "class": "data",
+        "group": "mac",
+        "default_class": "soft",
         "description": "MAC lane 1: VLEN-wide accumulator-add source D1 register",
     },
     "mac1_rob_entry_d1": {
@@ -101,17 +129,24 @@ TARGETS = {
             "u_mulmac", "INST_MAC", 1, "u_mac", "u_rob_entry_delay"),
         "signal": "q",
         "row_bits": 1,
-        "fault_model": "persistent",
+        "class": "control",
+        "group": "mac",
+        "default_class": "soft",
         "description": "MAC lane 1: which ROB entry to write back into (control)",
     },
     # ALU lane 0 (the CMP-capable unit): full pipeline payload register
     # between dispatch and execute stage P1. Holds the whole PIPE_DATA_t
-    # struct (opcode + vs1 + vs2 + vd + rob_entry + ...).
+    # struct (opcode + vs1 + vs2 + vd + rob_entry + ...). Tagged `mixed`
+    # because uniformly sampling its 505 bits hits both data and control.
+    # When the FT story needs a clean data-vs-control split, this entry
+    # should grow `data_bit_ranges` / `control_bit_ranges` (TODO).
     "alu0_uop_p1": {
         "path": _RVV_BACKEND_PREFIX + ("u_alu", "u_alu_cmp_unit", "uop_p1"),
         "signal": "q",
         "row_bits": 8,
-        "fault_model": "persistent",
+        "class": "mixed",
+        "group": "alu",
+        "default_class": "soft",
         "description": "ALU unit 0: P1 pipeline payload (struct, opcode+operands+rob)",
     },
     # DIV unit: result information register feeding into the iterative
@@ -121,10 +156,51 @@ TARGETS = {
             "u_div", "DIV_UNIT", 0, "u_div_unit", "res_information"),
         "signal": "q",
         "row_bits": 8,
-        "fault_model": "persistent",
+        "class": "mixed",
+        "group": "div",
+        "default_class": "soft",
         "description": "DIV unit: result-info struct register (data + rob entry)",
     },
 }
+
+
+# Group / class expansions accepted by `FI_TARGET`. Order is preserved
+# so deterministic seeds still produce repeatable bit schedules across
+# runs that sweep a group.
+def _targets_with(predicate):
+    return [k for k, v in TARGETS.items() if predicate(v)]
+
+
+TARGET_GROUPS = {
+    # Functional-unit groups (one entry per RVV submodule).
+    "vrf":     _targets_with(lambda v: v["group"] == "vrf"),
+    "rob":     _targets_with(lambda v: v["group"] == "rob"),
+    "mac":     _targets_with(lambda v: v["group"] == "mac"),
+    "alu":     _targets_with(lambda v: v["group"] == "alu"),
+    "div":     _targets_with(lambda v: v["group"] == "div"),
+    # Class groups (cuts across functional units).
+    "data":    _targets_with(lambda v: v["class"] == "data"),
+    "control": _targets_with(lambda v: v["class"] == "control"),
+    "mixed":   _targets_with(lambda v: v["class"] == "mixed"),
+    # Convenience.
+    "all":     list(TARGETS.keys()),
+}
+
+
+def expand_target_spec(name):
+    """Resolve `name` to an ordered list of target keys.
+
+    Accepts either a single target key (returns [name]) or a group /
+    class key from `TARGET_GROUPS` (returns its members). Raises with a
+    helpful error otherwise.
+    """
+    if name in TARGETS:
+        return [name]
+    if name in TARGET_GROUPS:
+        return list(TARGET_GROUPS[name])
+    raise KeyError(
+        f"unknown FI_TARGET '{name}'. Known targets: {sorted(TARGETS)}; "
+        f"known groups: {sorted(TARGET_GROUPS)}")
 
 # Signal used by Campaign C to gate injection on "RVV is doing real work".
 # When at least one ROB entry is valid, the backend is processing an RVV uop
@@ -139,6 +215,30 @@ ACTIVITY_GATE = {
 # Back-compat aliases used by the early prototype.
 DEFAULT_VRF_PATH = TARGETS["vrf_storage"]["path"]
 DEFAULT_VREG_SIGNAL = TARGETS["vrf_storage"]["signal"]
+
+
+# Fault-class/model taxonomy used by run_campaign:
+#   class 'soft':
+#     model 'seu' : single XOR, persists until the design naturally
+#                   overwrites the cell. Implemented by `persistent_bit_flip`.
+#                   Canonical SEU model for FFs and SRAM cells.
+#     model 'set' : XOR, hold for `hold_cycles`, XOR back. Combinational
+#                   glitch / SET. Use only on logic that is not latched.
+#                   Implemented by `transient_bit_flip`.
+#   class 'hard':
+#     model 'stuck0' / 'stuck1' :
+#                   from inject_cycle until run end, every clock edge
+#                   forces the bit to 0 or 1 -- this overrides design
+#                   writes (true permanent fault). Implemented by
+#                   `permanent_stuck_at`.
+FAULT_CLASS_DEFAULT_MODEL = {
+    "soft": "seu",
+    "hard": "stuck0",
+}
+FAULT_MODELS_BY_CLASS = {
+    "soft": ("seu", "set"),
+    "hard": ("stuck0", "stuck1"),
+}
 
 
 def get_target(name):
@@ -330,6 +430,49 @@ async def transient_bit_flip(clock, signal, bit_index, hold_cycles=1,
         await RisingEdge(clock)
     post = int(signal.value)
     signal.value = post ^ mask
+
+
+async def permanent_stuck_at(clock, signal, bit_index, value, *, log=True):
+    """Hard-fault model: force `bit_index` of `signal` to `value` every
+    cycle until cancelled.
+
+    On every rising edge of `clock`, after the design's NBA region has
+    written the cell, this coroutine re-deposits the bit so the forced
+    value wins. This is the standard behavioural model for a permanent
+    stuck-at fault on a flip-flop or SRAM cell -- writes from the design
+    are observed but immediately overwritten, simulating a broken cell.
+
+    Never returns. The caller is expected to spawn this with
+    `cocotb.start_soon` and kill the task at end of run (e.g. by killing
+    the parent injection task).
+    """
+    if signal is None:
+        raise RuntimeError("permanent_stuck_at: signal handle is None")
+    if value not in (0, 1):
+        raise ValueError(f"permanent_stuck_at: value must be 0 or 1, "
+                         f"got {value!r}")
+    width = len(signal)
+    if bit_index < 0 or bit_index >= width:
+        raise IndexError(
+            f"bit_index {bit_index} out of range [0,{width})")
+    mask = 1 << bit_index
+    if log:
+        cocotb.log.info(
+            "fi: stuck-at-%d on bit %d (width=%d), holding every cycle",
+            value, bit_index, width)
+    while True:
+        await RisingEdge(clock)
+        try:
+            current = int(signal.value)
+        except Exception:  # noqa: BLE001
+            # Signal may transiently be X during reset; just retry next cycle.
+            continue
+        if value:
+            new = current | mask
+        else:
+            new = current & ~mask
+        if new != current:
+            signal.value = new
 
 
 def classify_outcome(*, fault_flag, status, max_abs_diff, argmax_match,

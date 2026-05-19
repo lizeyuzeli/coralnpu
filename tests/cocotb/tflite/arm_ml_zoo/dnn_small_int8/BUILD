@@ -32,16 +32,6 @@ VCS_COMMON_DATA = [
     "//hdl/verilog:dpi_files",
 ]
 
-# Export the reference IO so the fault-injection campaign in
-# //tests/cocotb/fault_injection can reuse the same input/output vectors.
-exports_files(
-    [
-        "test_data/input_0.npy",
-        "test_data/expected_output_0.npy",
-    ],
-    visibility = ["//visibility:public"],
-)
-
 # Embed the .tflite flatbuffer as C arrays.
 generate_cc_arrays(
     name = "dnn_s_quantized_cc",
@@ -79,14 +69,6 @@ DNN_SMALL_INT8_TESTCASES = [
     "core_mini_rvv_dnn_small_int8",
 ]
 
-# Public alias for the ELF filegroup so the fault-injection campaign in
-# //tests/cocotb/fault_injection can depend on it cross-package.
-filegroup(
-    name = "run_dnn_small_int8_binary_elf_public",
-    srcs = [":run_dnn_small_int8_binary.elf"],
-    visibility = ["//visibility:public"],
-)
-
 cocotb_test_suite(
     name = "cocotb_dnn_small_int8",
     simulators = [
@@ -105,6 +87,50 @@ cocotb_test_suite(
         "size": "enormous",
         "test_module": ["cocotb_dnn_small_int8.py"],
         "deps": [
+            "//coralnpu_test_utils:core_mini_axi_sim_interface",
+            "//coralnpu_test_utils:sim_test_fixture",
+            "@rules_python//python/runfiles",
+        ],
+        "data": [
+            "run_dnn_small_int8_binary.elf",
+            "test_data/input_0.npy",
+            "test_data/expected_output_0.npy",
+        ],
+    },
+    vcs_build_args = VCS_BUILD_ARGS,
+    vcs_data = glob(["**/*.elf"]) + glob(["test_data/*.npy"]) + VCS_COMMON_DATA,
+    vcs_defines = VCS_DEFINES,
+    vcs_test_args = VCS_TEST_ARGS,
+    vcs_verilog_sources = ["//hdl/chisel/src/coralnpu:rvv_core_mini_highmem_axi_cc_library_verilog"],
+    verilator_model = "//tests/cocotb:rvv_core_mini_highmem_axi_model",
+)
+
+# Fault-injection campaign on this model. The reusable harness lives in
+# //tests/cocotb/fault_injection (target registry, bit-flip primitives,
+# campaign scheduler, CSV writer); only the model-specific glue lives here.
+DNN_SMALL_INT8_FI_TESTCASES = [
+    "core_mini_rvv_dnn_small_int8_fi",
+]
+
+cocotb_test_suite(
+    name = "cocotb_dnn_small_int8_fi",
+    simulators = [
+        "verilator",
+        "vcs",
+    ],
+    testcases = DNN_SMALL_INT8_FI_TESTCASES,
+    testcases_vname = "DNN_SMALL_INT8_FI_TESTCASES",
+    tests_kwargs = {
+        "waves": False,
+        # Manual-only: this is a research/eval flow, not part of CI.
+        "tags": ["manual"],
+        "hdl_toplevel": "RvvCoreMiniHighmemAxi",
+        "seed": "42",
+        "size": "enormous",
+        "test_module": ["cocotb_dnn_small_int8_fi.py"],
+        "deps": [
+            "//tests/cocotb/fault_injection:fi_utils",
+            "//tests/cocotb/fault_injection:fi_campaign",
             "//coralnpu_test_utils:core_mini_axi_sim_interface",
             "//coralnpu_test_utils:sim_test_fixture",
             "@rules_python//python/runfiles",
