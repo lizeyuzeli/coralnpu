@@ -352,6 +352,8 @@ chisel_library(
         "Core.scala",
         "CoreAxi.scala",
         "CoreAxiCSR.scala",
+        "CoreAxiKernel.scala",
+        "CoreChip.scala",
         "CoreTlul.scala",
         "Fabric.scala",
         "SRAM.scala",
@@ -368,6 +370,7 @@ chisel_library(
         "//hdl/chisel/src/bus",
         "//hdl/chisel/src/common",
         "//hdl/chisel/src/common:instruction_buffer",
+        "//hdl/chisel/src/coralnpu/link",
     ],
 )
 
