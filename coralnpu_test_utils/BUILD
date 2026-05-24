@@ -62,6 +62,15 @@ py_library(
 )
 
 py_library(
+    name = "jtag_dtm",
+    srcs = ["jtag_dtm.py"],
+    deps = [
+        requirement("cocotb"),
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "core_mini_axi_sim_interface",
     srcs = [
         "core_mini_axi_interface.py",

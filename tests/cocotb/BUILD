@@ -381,6 +381,58 @@ template_rule(
     vcs_test_args = VCS_TEST_ARGS,
 )
 
+# BEGIN_TESTCASES_FOR_core_mini_axi_jtag_debug_cocotb
+# Exercise the NEW JTAG -> on-chip dmi_jtag -> kernel.io.dm path (see
+# hdl/verilog/dbg/CoralnpuDmiJtag.sv).  The existing
+# `core_mini_axi_debug_*` tests cover the same DM via the AXI-CSR
+# mailbox; these tests cover the same DM via the JTAG transport.
+CORE_MINI_AXI_JTAG_DEBUG_TESTCASES = [
+    "core_mini_axi_jtag_idcode",
+    "core_mini_axi_jtag_dtmcs",
+    "core_mini_axi_jtag_dmactive",
+    "core_mini_axi_jtag_probe_impl",
+    "core_mini_axi_jtag_halt_resume",
+]
+# END_TESTCASES_FOR_core_mini_axi_jtag_debug_cocotb
+
+CORE_MINI_AXI_JTAG_DEBUG_COMMON_TEST_KWARGS = {
+    "deps": [
+        "//coralnpu_test_utils:core_mini_axi_sim_interface",
+        "//coralnpu_test_utils:jtag_dtm",
+        "@bazel_tools//tools/python/runfiles",
+    ],
+    "waves": False,
+    "seed": "42",
+    "test_module": ["core_mini_axi_jtag_debug.py"],
+    "data": COCOTB_DEBUG_TEST_BINARY_TARGETS,
+    "default_testcase_size": "medium",
+    "size": "medium",
+}
+
+template_rule(
+    cocotb_test_suite,
+    {
+        "core_mini_axi_jtag_debug_cocotb": {
+            "tests_kwargs": dict(
+                CORE_MINI_AXI_JTAG_DEBUG_COMMON_TEST_KWARGS,
+                hdl_toplevel = "CoreMiniAxi",
+            ),
+            "vcs_verilog_sources": ["//hdl/chisel/src/coralnpu:core_mini_axi_cc_library_verilog"],
+            "verilator_model": ":core_mini_axi_model",
+        },
+    },
+    simulators = [
+        "verilator",
+        "vcs",
+    ],
+    testcases = CORE_MINI_AXI_JTAG_DEBUG_TESTCASES,
+    testcases_vname = "CORE_MINI_AXI_JTAG_DEBUG_TESTCASES",
+    vcs_build_args = VCS_BUILD_ARGS,
+    vcs_data = COCOTB_DEBUG_TEST_BINARY_TARGETS + VCS_COMMON_DATA,
+    vcs_defines = VCS_DEFINES,
+    vcs_test_args = VCS_TEST_ARGS,
+)
+
 cocotb_test_suite(
     name = "rvv_assembly_cocotb_test",
     simulators = [

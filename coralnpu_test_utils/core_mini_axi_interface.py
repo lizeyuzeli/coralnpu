@@ -176,6 +176,21 @@ class CoreMiniAxiInterface:
     # We drive the DM directly via the CSR route.
     self.dut.io_dm_req_valid.value = 0
     self.dut.io_dm_rsp_ready.value = 0
+    # New in v1: CoreAxi exposes JTAG pads for the on-chip dmi_jtag in
+    # CoreChip. Initialize them to a "no-JTAG-activity" idle so the
+    # existing CSR-mailbox debug tests are unaffected. Tests that
+    # actively exercise JTAG (see `coralnpu_test_utils.jtag_dtm`) drive
+    # these pins after `__init__` returns.
+    #   * tck   : held low (no clock edges).
+    #   * tms   : 1 (TAP stays in TestLogicReset).
+    #   * trst_n: 1 (no async TAP reset). The dmi_jtag's clk_i-domain
+    #             reset is still tied to io_aresetn, so dmi_jtag will
+    #             also come out of reset in lock-step with the core.
+    #   * td_i  : 0.
+    self.dut.io_tck.value = 0
+    self.dut.io_tms.value = 1
+    self.dut.io_trst_n.value = 1
+    self.dut.io_td_i.value = 0
     self.axi_slave_read_addr = ReadyValidInterface(
         self.dut, "io_axi_slave_read_addr")
     self.axi_slave_read_addr.clear_valid()

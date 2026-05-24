@@ -370,6 +370,7 @@ chisel_library(
         "//hdl/chisel/src/bus",
         "//hdl/chisel/src/common",
         "//hdl/chisel/src/common:instruction_buffer",
+        "//hdl/chisel/src/coralnpu/dbg",
         "//hdl/chisel/src/coralnpu/link",
     ],
 )

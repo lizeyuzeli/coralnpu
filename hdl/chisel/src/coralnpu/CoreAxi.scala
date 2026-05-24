@@ -26,9 +26,13 @@
 //   * boot_addr is reduced internally to a 1-bit boot_sel
 //     (`==0x10000000`).
 //   * dm / debug are NOT exposed by CoreChip (so DC will optimise the
-//     unused debug paths out of the tape-out netlist). The matching IOs
-//     here are tied off so cocotb's framework still binds; tests that
-//     actively exercise dm/debug will fail until on-chip dmi_jtag lands.
+//     unused debug paths out of the tape-out netlist).  CoreChip
+//     instantiates an on-chip dmi_jtag driving the kernel's dm port,
+//     and CoreAxi now exposes JTAG pads (tck/tms/trst_n/td_i/td_o/
+//     tdo_oe) so cocotb tests can reach the debug module through
+//     standard JTAG instead of the legacy parallel `dm_*` interface.
+//     The pre-existing `dm_*` / `debug_*` IO is retained tied off for
+//     byte-compat with the existing cocotb framework binders.
 
 package coralnpu
 
@@ -61,6 +65,16 @@ class CoreAxi(p: Parameters, coreModuleName: String) extends RawModule {
     val debug = new DebugIO(p)
     val dm = new DebugModuleIO(p)
     val te = Input(Bool())
+    // JTAG pads (new in v1: on-chip dmi_jtag in CoreChip drives the
+    // debug module). Exposed here so cocotb can drive them; existing
+    // io.dm/io.debug tie-offs below stay for byte-compat with the
+    // previous CoreAxi IO surface.
+    val tck       = Input(Clock())
+    val tms       = Input(Bool())
+    val trst_n    = Input(Bool())
+    val td_i      = Input(Bool())
+    val td_o      = Output(Bool())
+    val tdo_oe    = Output(Bool())
   })
   dontTouch(io)
 
@@ -98,8 +112,19 @@ class CoreAxi(p: Parameters, coreModuleName: String) extends RawModule {
   io.fault := chip.io.fault
   io.wfi := chip.io.wfi
 
-  // dm/debug not exposed by CoreChip in v1 (DC will optimise them out).
-  // Tie off the verif-top IO so cocotb framework can still bind.
+  // JTAG pads route straight through to the on-chip dmi_jtag.
+  chip.io.tck_i    := io.tck
+  chip.io.tms_i    := io.tms
+  chip.io.trst_ni  := io.trst_n
+  chip.io.td_i     := io.td_i
+  io.td_o   := chip.io.td_o
+  io.tdo_oe := chip.io.tdo_oe_o
+
+  // dm/debug ports are NOT exposed by CoreChip; on-chip dmi_jtag inside
+  // CoreChip drives the debug module from the JTAG pads above. The
+  // verif-top dm/debug IO are kept for byte-compat with the previous
+  // CoreAxi surface and are tied off here so cocotb's framework still
+  // binds. Tests that need debug access should drive the new JTAG pads.
   io.dm.req.ready := false.B
   io.dm.rsp.valid := false.B
   io.dm.rsp.bits := DontCare

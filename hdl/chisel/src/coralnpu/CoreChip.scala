@@ -13,14 +13,18 @@
 // limitations under the License.
 //
 // CoreChip: physical-die top wrapping CoreAxiKernel + the chip-side
-// LinkAdapter (the AXI-over-link bridge). Plan ref: §2/§4.
+// LinkAdapter (the AXI-over-link bridge) + an on-chip DMI-over-JTAG
+// debug TAP (CoralnpuDmiJtag, see hdl/verilog/dbg/CoralnpuDmiJtag.sv).
+// Plan ref: §2/§3/§4.
 //
-// v1 tape-out target: dm and debug are NOT exposed on CoreChip's external
-// IO. The kernel's `dm` request side is tied off (no debug-module activity)
-// and its `debug` output bundle is consumed locally and left dangling, so
-// DC will optimise the entire DebugModule + debug-trace fanout out of the
-// netlist. A future revision will introduce on-chip dmi_jtag + JTAG pads
-// on this same boundary.
+// v1 tape-out target:
+//   * JTAG pads (tck/tms/trst_n/td_i/td_o + tdo_oe) are now exposed on the
+//     CoreChip boundary. The on-chip dmi_jtag drives the kernel's `dm`
+//     port directly so the debug module is fully usable from the chip
+//     pads -- no `dm_*` ports leave the die.
+//   * `debug` (Ibex-style trace bundle) is still NOT exposed on the chip
+//     boundary; the kernel output is left dangling so DC will optimise
+//     the trace fanout out of the netlist.
 
 package coralnpu
 
@@ -28,6 +32,7 @@ import chisel3._
 
 import coralnpu.link.LinkFrame.kBeatBits
 import coralnpu.link.LinkAdapter
+import coralnpu.dbg.CoralnpuDmiJtag
 
 class CoreChip(p: Parameters, coreModuleName: String) extends RawModule {
   override val desiredName = coreModuleName + "Chip"
@@ -46,8 +51,14 @@ class CoreChip(p: Parameters, coreModuleName: String) extends RawModule {
     // Test enable / boot select
     val te        = Input(Bool())
     val boot_sel  = Input(Bool())
+    // JTAG pads. See plan §2.1.
+    val tck_i     = Input(Clock())
+    val tms_i     = Input(Bool())
+    val trst_ni   = Input(Bool())
+    val td_i      = Input(Bool())
+    val td_o      = Output(Bool())
+    val tdo_oe_o  = Output(Bool())
     // Inter-die Link.
-    // (dm and debug intentionally NOT exposed -- see header comment.)
     val link_tx_clk    = Input(Clock())
     val link_tx_rstn   = Input(AsyncReset())
     val link_tx_valid  = Output(Bool())
@@ -74,12 +85,35 @@ class CoreChip(p: Parameters, coreModuleName: String) extends RawModule {
   io.fault := kernel.io.fault
   io.wfi := kernel.io.wfi
 
-  // Tie off kernel.dm: no debug-module requests in v1 tape-out.
-  kernel.io.dm.req.valid := false.B
-  kernel.io.dm.req.bits := DontCare
-  kernel.io.dm.rsp.ready := true.B
+  // ------------------------------------------------------------------------
+  // On-chip DMI-over-JTAG (plan §3). Drives kernel.dm directly from the
+  // JTAG pads; no dm_* signals leave the die.
+  // ------------------------------------------------------------------------
+  val dmi = Module(new CoralnpuDmiJtag())
+  dmi.io.clk_i   := io.clk_core
+  dmi.io.rst_ni  := io.aresetn.asBool
+  dmi.io.tck_i   := io.tck_i
+  dmi.io.tms_i   := io.tms_i
+  dmi.io.trst_ni := io.trst_ni
+  dmi.io.td_i    := io.td_i
+  io.td_o     := dmi.io.td_o
+  io.tdo_oe_o := dmi.io.tdo_oe_o
+
+  // Drive kernel.dm.req from dmi (master) -- kernel side is Flipped so
+  // valid/bits are inputs, ready is output.
+  kernel.io.dm.req.valid          := dmi.io.dmi_req_valid_o
+  kernel.io.dm.req.bits.address   := dmi.io.dmi_req_addr_o
+  kernel.io.dm.req.bits.data      := dmi.io.dmi_req_data_o
+  kernel.io.dm.req.bits.op        := dmi.io.dmi_req_op_o.asTypeOf(DmReqOp())
+  dmi.io.dmi_req_ready_i          := kernel.io.dm.req.ready
+
+  // Pipe kernel.dm.rsp back to dmi.
+  dmi.io.dmi_resp_valid_i := kernel.io.dm.rsp.valid
+  dmi.io.dmi_resp_data_i  := kernel.io.dm.rsp.bits.data
+  dmi.io.dmi_resp_resp_i  := kernel.io.dm.rsp.bits.op.asUInt
+  kernel.io.dm.rsp.ready  := dmi.io.dmi_resp_ready_o
+
   // kernel.io.debug is all-Output; let DC prune its fanout (no consumer).
-  // Keep a sink so Chisel doesn't drop the connection during elaboration.
   dontTouch(kernel.io.debug)
 
   // Chip-side LinkAdapter.
