@@ -757,6 +757,10 @@ typedef struct packed {
   BYTE_TYPE_t                         byte_type;          //wr Byte mask
   RVVConfigState                      vector_csr;         //Receive Vstart, vlen,... And need to update vcsr when trap
   logic                               last_uop_valid;
+`ifdef FAULT_TOLERANT_ON
+  logic                               is_ft;              //DMR: this uop is fault-tolerant (duplicated & entry-compared)
+  logic   [1:0]                       ft_unit;            //DMR: replay target RS: 0=ALU,1=MUL/MAC,2=DIV (program order; ROB mirrors to physical)
+`endif
 } DP2ROB_t;
 
 // send ROB info to DP

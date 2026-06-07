@@ -172,6 +172,34 @@ module rvv_backend
     logic         [`NUM_DP_UOP-1:0]       rs_valid_dp2div;
     DIV_RS_t      [`NUM_DP_UOP-1:0]       rs_dp2div;
     logic         [`NUM_DP_UOP-1:0]       rs_ready_div2dp;
+`ifdef FAULT_TOLERANT_ON
+  // DMR reinject datapath (top level = hands): replay_mem + freeslot + RS MUX.
+  // replay_mem holds copy-1's RS payload for every replicable arithmetic unit,
+  // depth = ROB, indexed by physical rob_entry (1:1 with un-retired entries).
+  // Width = strict max over ALL replicated RS payloads (ALU/MUL/DIV + FMA when
+  // ZVE32F_ON), so a wider struct can never be silently truncated on capture.
+  `ifdef ZVE32F_ON
+    localparam int FT_RS_W = `MAX4($bits(ALU_RS_t),$bits(MUL_RS_t),$bits(DIV_RS_t),$bits(FMA_RS_t));
+  `else
+    localparam int FT_RS_W = `MAX4($bits(ALU_RS_t),$bits(MUL_RS_t),$bits(DIV_RS_t),0);
+  `endif
+    logic [FT_RS_W-1:0]                   replay_mem [`ROB_DEPTH-1:0];
+  // reinject command bus: [unit][port], unit 0=ALU,1=MUL/MAC,2=DIV,3=FMA
+    logic [3:0][`NUM_DP_UOP-1:0]                   reinject_freeslot_dp2rob;
+    logic [3:0][`NUM_DP_UOP-1:0]                   reinject_valid_rob2dp;
+    logic [3:0][`NUM_DP_UOP-1:0][`ROB_DEPTH_WIDTH-1:0] reinject_entry_rob2dp;
+  // muxed RS push/datain (normal dispatch OR reinject on free ports)
+    logic         [`NUM_DP_UOP-1:0]       alu_push_ft;
+    ALU_RS_t      [`NUM_DP_UOP-1:0]       alu_datain_ft;
+    logic         [`NUM_DP_UOP-1:0]       mul_push_ft;
+    MUL_RS_t      [`NUM_DP_UOP-1:0]       mul_datain_ft;
+    logic         [`NUM_DP_UOP-1:0]       div_push_ft;
+    DIV_RS_t      [`NUM_DP_UOP-1:0]       div_datain_ft;
+  `ifdef ZVE32F_ON
+    logic         [`NUM_DP_UOP-1:0]       fma_push_ft;
+    FMA_RS_t      [`NUM_DP_UOP-1:0]       fma_datain_ft;
+  `endif
+`endif
 `ifdef ZVE32F_ON
     // FMA_RS
     logic         [`NUM_DP_UOP-1:0]       fma_rs_almost_full;
@@ -515,6 +543,89 @@ module rvv_backend
         .rob_entry            (uop_rob2dp)
     );
 
+`ifdef FAULT_TOLERANT_ON
+  // ===== DMR reinject datapath (top level = hands) =========================
+  // freeslot: a push port is free for reinject when its RS can accept and
+  // normal dispatch is not using it this cycle (the two are mutually exclusive
+  // per port, so reinject only ever lands on idle ports).
+    genvar ft_p;
+    generate
+      for (ft_p=0; ft_p<`NUM_DP_UOP; ft_p++) begin : gen_ft_freeslot
+        assign reinject_freeslot_dp2rob[0][ft_p] = rs_ready_alu2dp[ft_p] & ~rs_valid_dp2alu[ft_p];
+        assign reinject_freeslot_dp2rob[1][ft_p] = rs_ready_mul2dp[ft_p] & ~rs_valid_dp2mul[ft_p];
+        assign reinject_freeslot_dp2rob[2][ft_p] = rs_ready_div2dp[ft_p] & ~rs_valid_dp2div[ft_p];
+      `ifdef ZVE32F_ON
+        assign reinject_freeslot_dp2rob[3][ft_p] = rs_ready_fma2dp[ft_p] & ~rs_valid_dp2fma[ft_p];
+      `else
+        assign reinject_freeslot_dp2rob[3][ft_p] = 1'b0; // no FMA RS when ZVE32F off
+      `endif
+      end
+    endgenerate
+
+  // replay_mem: capture copy-1's RS payload at the normal dispatch push,
+  // indexed by physical rob_entry. Each dispatch slot pushes to one unit, so
+  // the branches are mutually exclusive. No reset/flush: stale entries are
+  // overwritten on the next push and the ROB pending counter gates replay.
+    always_ff @(posedge clk) begin
+      for (int i=0; i<`NUM_DP_UOP; i++) begin
+        if      (rs_valid_dp2alu[i] & uop_dp2rob[i].is_ft)
+          replay_mem[rs_dp2alu[i].rob_entry] <= FT_RS_W'(rs_dp2alu[i]);
+        else if (rs_valid_dp2mul[i] & uop_dp2rob[i].is_ft)
+          replay_mem[rs_dp2mul[i].rob_entry] <= FT_RS_W'(rs_dp2mul[i]);
+        else if (rs_valid_dp2div[i] & uop_dp2rob[i].is_ft)
+          replay_mem[rs_dp2div[i].rob_entry] <= FT_RS_W'(rs_dp2div[i]);
+      `ifdef ZVE32F_ON
+        else if (rs_valid_dp2fma[i] & uop_dp2rob[i].is_ft)
+          replay_mem[rs_dp2fma[i].rob_entry] <= FT_RS_W'(rs_dp2fma[i]);
+      `endif
+      end
+    end
+
+  // reinject MUX: on a free port the ROB claimed, drive the replayed payload;
+  // otherwise pass normal dispatch through unchanged. Normal dispatch and
+  // reinject never claim the same port (freeslot excludes used ports), so the
+  // select is a clean per-port 2:1. rob_entry already lives inside the stored
+  // payload, so replaying it preserves the original ROB slot (INV-2).
+    always_comb begin
+      for (int p=0; p<`NUM_DP_UOP; p++) begin
+        // ALU
+        if (reinject_valid_rob2dp[0][p]) begin
+          alu_push_ft[p]   = 1'b1;
+          alu_datain_ft[p] = ALU_RS_t'(replay_mem[reinject_entry_rob2dp[0][p]]);
+        end else begin
+          alu_push_ft[p]   = rs_valid_dp2alu[p];
+          alu_datain_ft[p] = rs_dp2alu[p];
+        end
+        // MUL/MAC
+        if (reinject_valid_rob2dp[1][p]) begin
+          mul_push_ft[p]   = 1'b1;
+          mul_datain_ft[p] = MUL_RS_t'(replay_mem[reinject_entry_rob2dp[1][p]]);
+        end else begin
+          mul_push_ft[p]   = rs_valid_dp2mul[p];
+          mul_datain_ft[p] = rs_dp2mul[p];
+        end
+        // DIV
+        if (reinject_valid_rob2dp[2][p]) begin
+          div_push_ft[p]   = 1'b1;
+          div_datain_ft[p] = DIV_RS_t'(replay_mem[reinject_entry_rob2dp[2][p]]);
+        end else begin
+          div_push_ft[p]   = rs_valid_dp2div[p];
+          div_datain_ft[p] = rs_dp2div[p];
+        end
+      `ifdef ZVE32F_ON
+        // FMA (incl. FCVT/FCMP/FNCMP/FTBL/sqrt7/rec7)
+        if (reinject_valid_rob2dp[3][p]) begin
+          fma_push_ft[p]   = 1'b1;
+          fma_datain_ft[p] = FMA_RS_t'(replay_mem[reinject_entry_rob2dp[3][p]]);
+        end else begin
+          fma_push_ft[p]   = rs_valid_dp2fma[p];
+          fma_datain_ft[p] = rs_dp2fma[p];
+        end
+      `endif
+      end
+    end
+`endif
+
   // RS, Reserve station
     // ALU RS
     multi_fifo #(
@@ -529,8 +640,13 @@ module rvv_backend
         .clk          (clk),
         .rst_n        (rst_n),
       // write
+      `ifdef FAULT_TOLERANT_ON
+        .push         (alu_push_ft),
+        .datain       (alu_datain_ft),
+      `else
         .push         (rs_valid_dp2alu),
         .datain       (rs_dp2alu),
+      `endif
       // read
         .pop          (pop_alu2rs),
         .dataout      (uop_rs2alu),
@@ -603,8 +719,13 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+      `ifdef FAULT_TOLERANT_ON
+        .push           (mul_push_ft),
+        .datain         (mul_datain_ft),
+      `else
         .push           (rs_valid_dp2mul),
         .datain         (rs_dp2mul),
+      `endif
       // read
         .pop            (pop_mul2rs),
         .dataout        (uop_rs2mul),
@@ -640,8 +761,13 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+      `ifdef FAULT_TOLERANT_ON
+        .push           (div_push_ft),
+        .datain         (div_datain_ft),
+      `else
         .push           (rs_valid_dp2div),
         .datain         (rs_dp2div),
+      `endif
       // read
         .pop            (pop_div2rs),
         .dataout        (uop_rs2div),
@@ -678,8 +804,13 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+      `ifdef FAULT_TOLERANT_ON
+        .push           (fma_push_ft),
+        .datain         (fma_datain_ft),
+      `else
         .push           (rs_valid_dp2fma),
         .datain         (rs_dp2fma),
+      `endif
       // read
         .pop            (pop_fma2rs),       
         .dataout        (uop_rs2fma),       
@@ -1078,6 +1209,13 @@ module rvv_backend
         .trap_ready_rob2rmp     (trap_ready_rob2rmp),
         .trap_ready_rvv2rvs     (trap_ready_rvv2rvs),
         .trap_flush_rvv         (trap_flush_rvv)
+      `ifdef FAULT_TOLERANT_ON
+      // DMR reinject command bus
+        ,
+        .reinject_freeslot_dp2rob (reinject_freeslot_dp2rob),
+        .reinject_valid_rob2dp    (reinject_valid_rob2dp),
+        .reinject_entry_rob2dp    (reinject_entry_rob2dp)
+      `endif
     );
 
   // RT, Retire

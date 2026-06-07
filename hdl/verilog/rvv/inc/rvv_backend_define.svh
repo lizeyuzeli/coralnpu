@@ -7,6 +7,10 @@
 `endif
 `endif 
 
+// compile-time max helpers (used by DMR replay_mem width = max over replicated RS payloads)
+`define MAX2(a,b)               (((a)>(b))?(a):(b))
+`define MAX4(a,b,c,d)           `MAX2(`MAX2((a),(b)),`MAX2((c),(d)))
+
 // number of scalar core issue lane
 `define ISSUE_LANE              4
 
