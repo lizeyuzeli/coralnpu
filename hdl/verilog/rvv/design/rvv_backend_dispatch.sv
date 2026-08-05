@@ -543,6 +543,46 @@ module rvv_backend_dispatch
             assign uop_dp2rob[i].byte_type      = uop_operand_byte_type[i].vd;
             assign uop_dp2rob[i].vector_csr     = uop_uop2dp[i].vector_csr;
             assign uop_dp2rob[i].last_uop_valid = uop_uop2dp[i].last_uop_valid;
+          `ifdef FAULT_TOLERANT_ON
+          // DMR: tag fault-tolerant uops. Stage 1 integer = ALU/MUL/MAC/DIV.
+          // Stage 2 float: only PURE single-uop paths are duplicated. The FALU
+          // wrapper's addmul path (exe_unit==FMA: vfadd/vfmul/vfmacc...) and FDIV
+          // are pure per-uop functions and duplicate safely. FCMP/FNCMP/FCVT/FTBL
+          // are EXCLUDED: their wrapper sub-units carry cross-uop internal state
+          // (uop_index-keyed accumulators, info pipelines flushed on last_uop) so
+          // a duplicated copy corrupts shared state — same class as INV-5.
+          // VME/VMELSU (Zvt matrix engine) are likewise EXCLUDED: their uops set
+          // pshrob_valid=0 so they never enter the ROB, leaving no shared entry
+          // to compare on, and the tile accumulator is a destructive read-modify-
+          // write so a duplicate would accumulate twice. is_ft is a WHITELIST, so
+          // these new EXE_UNIT_e values are excluded automatically.
+          // ft_unit selects the replay target RS: 0=ALU, 1=MUL/MAC, 2=DIV, 3=FALU.
+          // FDIV shares the DIV RS (DIV_RS_t payload) so it maps to unit 2.
+          // ft_global_en is the run-time CSR enable; tied to 1 in Stage 1/2 (the
+          // FAULT_TOLERANT_ON compile switch already gates all FT logic), wired
+          // to the CSR in Stage 3.
+            assign uop_dp2rob[i].is_ft          = 1'b1 &
+                                                  ((uop_uop2dp[i].uop_exe_unit == ALU) ||
+                                                   (uop_uop2dp[i].uop_exe_unit == MUL) ||
+                                                   (uop_uop2dp[i].uop_exe_unit == MAC) ||
+                                                   (uop_uop2dp[i].uop_exe_unit == DIV)
+                                                `ifdef ZVE32F_ON
+                                                || (uop_uop2dp[i].uop_exe_unit == FMA)  ||
+                                                   (uop_uop2dp[i].uop_exe_unit == FDIV)
+                                                `endif
+                                                  );
+            assign uop_dp2rob[i].ft_unit        =
+                                                `ifdef ZVE32F_ON
+                                                  (uop_uop2dp[i].uop_exe_unit == FMA) ? 2'd3 :
+                                                  ((uop_uop2dp[i].uop_exe_unit == DIV)  ||
+                                                   (uop_uop2dp[i].uop_exe_unit == FDIV)) ? 2'd2 :
+                                                `else
+                                                  (uop_uop2dp[i].uop_exe_unit == DIV) ? 2'd2 :
+                                                `endif
+                                                  ((uop_uop2dp[i].uop_exe_unit == MUL) ||
+                                                   (uop_uop2dp[i].uop_exe_unit == MAC)) ? 2'd1 :
+                                                                                          2'd0;
+          `endif
         end
     endgenerate
 

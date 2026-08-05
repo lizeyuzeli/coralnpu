@@ -1,6 +1,34 @@
 `ifndef HDL_VERILOG_RVV_DESIGN_RVV_DEFINE_SVH
 `define HDL_VERILOG_RVV_DESIGN_RVV_DEFINE_SVH
 
+// compile-time max helpers (used by DMR replay_mem width = max over replicated RS payloads)
+`define MAX2(a,b)               (((a)>(b))?(a):(b))
+`define MAX4(a,b,c,d)           `MAX2(`MAX2((a),(b)),`MAX2((c),(d)))
+
+// FAULT TOLERANCE (DMR instruction duplication) — default OFF (single switch).
+// Upstream rvv2p5 removed rvv_backend_config.svh and merged all config macros
+// here, so the FT switches live here now. Uncomment to enable FT; reuses the
+// same cocotb tests, no per-test +define+ needed. When OFF, every
+// `ifdef FAULT_TOLERANT_ON block vanishes and the build is bit-identical to
+// baseline (INV-1).
+//`define FAULT_TOLERANT_ON
+
+// FT transient-fault in-place retry cap K (on exhaustion, falls back to the
+// existing trap_flush_rvv global flush, see INV-5). `ifndef gives a default
+// that an external +define+FT_RETRY_MAX=N can override.
+`ifndef FT_RETRY_MAX
+  `define FT_RETRY_MAX 3
+`endif
+
+// FT injection self-test — default OFF. Only meaningful with FAULT_TOLERANT_ON.
+// When ON, the ROB forces one (and only one) wrong result per is_ft entry
+// before its first compare, driving it through
+// mismatch -> rollback -> retry -> recover to validate the whole
+// duplicate+compare+rollback chain. Must be one-time only: otherwise every
+// retry re-injects -> permanent mismatch -> hits K -> trap -> regression fail;
+// hence it relies on FT_RETRY_MAX>1 for recovery headroom.
+//`define FT_INJECT_ON
+
 // number of scalar core issue lane
 `define ISSUE_LANE              4
 

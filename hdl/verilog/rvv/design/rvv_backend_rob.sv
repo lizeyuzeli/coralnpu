@@ -37,8 +37,14 @@ module rvv_backend_rob
     trap_rob_entry_rmp2rob,
     trap_ready_rob2rmp,
     trap_ready_rvv2rvs,
-    trap_flush_rvv    
-);  
+    trap_flush_rvv
+`ifdef FAULT_TOLERANT_ON
+    ,
+    reinject_freeslot_dp2rob,   // in : per-unit per-port free RS push slot mask this cycle
+    reinject_valid_rob2dp,      // out: per-unit per-port replay request
+    reinject_entry_rob2dp       // out: per-unit per-port physical ROB entry to replay
+`endif
+);
 // global signal
     input   logic                   clk;
     input   logic                   rst_n;
@@ -71,8 +77,17 @@ module rvv_backend_rob
     input   logic                           trap_valid_rmp2rob;
     input   logic   [`ROB_DEPTH_WIDTH-1:0]  trap_rob_entry_rmp2rob;
     output  logic                           trap_ready_rob2rmp;
-    output  logic                           trap_ready_rvv2rvs;    
-    output  logic                           trap_flush_rvv;        
+    output  logic                           trap_ready_rvv2rvs;
+    output  logic                           trap_flush_rvv;
+
+`ifdef FAULT_TOLERANT_ON
+// DMR reinject command bus (ROB = brain, dispatch = hands)
+// dispatch feeds a per-unit per-port free-slot mask; ROB fills slots with pending replays.
+// unit index: 0=ALU, 1=MUL/MAC, 2=DIV (+FDIV), 3=FMA. port index: 0..NUM_DP_UOP-1 (the RS push port).
+    input   logic [3:0][`NUM_DP_UOP-1:0]                   reinject_freeslot_dp2rob; // [unit][port] 1=free
+    output  logic [3:0][`NUM_DP_UOP-1:0]                   reinject_valid_rob2dp;    // [unit][port] 1=replay this port
+    output  logic [3:0][`NUM_DP_UOP-1:0][`ROB_DEPTH_WIDTH-1:0] reinject_entry_rob2dp; // [unit][port] physical entry
+`endif
 
 // ---internal signal definition--------------------------------------
     logic                               trap_in;
@@ -91,12 +106,41 @@ module rvv_backend_rob
     RES_ROB_t [`ROB_DEPTH-1:0]          res_mem;
     logic     [`ROB_DEPTH-1:0]          uop_done;
 
+`ifdef FAULT_TOLERANT_ON
+  // DMR fault-tolerance, physical-entry indexed (aligned with res_mem/uop_done/trap_flag)
+    logic     [`ROB_DEPTH-1:0]          ft_flag;        // entry is fault-tolerant (mirror of is_ft, physical order)
+    logic     [`ROB_DEPTH-1:0][1:0]     ft_unit;        // replay target unit, physical order (mirror of DP2ROB.ft_unit)
+    logic     [`ROB_DEPTH-1:0]          got_first;      // first DMR copy result has arrived & been stored
+    logic     [1:0]                     retry_cnt [`ROB_DEPTH-1:0]; // rollback count, trap when reaching FT_RETRY_MAX
+    logic     [`ROB_DEPTH-1:0][1:0]     ft_reinject_pend; // copies still owed for this entry: copy-2 (=1) or both (=2)
+  // per-entry combinational DMR decision (physical order), driven by ft_decode below
+    logic     [`ROB_DEPTH-1:0]          ft_set_done;    // DMR check passed this cycle -> allow retire
+    logic     [`ROB_DEPTH-1:0]          ft_set_first;   // first copy arrived this cycle -> latch, suppress done
+    logic     [`ROB_DEPTH-1:0]          ft_rollback;    // DMR mismatch this cycle -> resend both copies
+  // reinject bookkeeping (physical order)
+    logic     [`ROB_DEPTH-1:0]          entry_valid_phys;   // entry_valid mirrored to physical order
+    logic     [`ROB_DEPTH-1:0]          entry_valid_phys_q; // registered, for rising-edge push detect
+    logic     [`ROB_DEPTH-1:0]          new_ft_push;        // FT entry first becomes valid -> owe copy-2
+    logic     [`ROB_DEPTH-1:0][1:0]     reinject_accept;    // copies dispatched this cycle per entry (for pend decrement)
+  // retry-exhaustion handoff: K rollbacks reached -> fall back to global trap (INV-5)
+    logic     [`ROB_DEPTH-1:0]          ft_trap_req;        // this cycle's rollback would hit FT_RETRY_MAX
+`ifdef FT_INJECT_ON
+  // self-test: force a one-time mismatch per FT entry to exercise the
+  // duplicate->compare->rollback->retry->recover chain (see config.svh).
+    logic     [`ROB_DEPTH-1:0]          injected;           // fault already injected for this entry instance
+    logic     [`ROB_DEPTH-1:0]          ft_inject_fire;     // injection forced this cycle
+`endif
+`endif
+
   // trap
     logic     [`ROB_DEPTH-1:0]          trap_flag;
 
   // temp signal
     logic     [`ROB_DEPTH_WIDTH-1:0]    wind_uop_wptr [`ROB_DEPTH-1:0];
     logic     [`ROB_DEPTH_WIDTH-1:0]    wind_uop_rptr [`ROB_DEPTH-1:0];
+`ifdef FAULT_TOLERANT_ON
+    localparam int NUM_SMPORT_IDX = (`NUM_SMPORT > 1) ? $clog2(`NUM_SMPORT) : 1;
+`endif
 
     genvar                              i,j;
 // ---code start------------------------------------------------------
@@ -202,7 +246,46 @@ module rvv_backend_rob
            assign wind_uop_wptr[i] = uop_wptr+i;
          end
      endgenerate
-    
+
+`ifdef FAULT_TOLERANT_ON
+  // ---- DMR: mirror is_ft into physical-entry order --------------------
+  // uop_info is program-order: uop_info[p] == mem[uop_rptr+p].
+  // => physical entry E maps to program slot (E-uop_rptr), so
+  //    uop_info[E-uop_rptr].is_ft is the is_ft of the uop physically at E,
+  //    aligned with res_mem/uop_done/trap_flag (all physical-indexed).
+  generate
+    for (i=0; i<`ROB_DEPTH; i++) begin : gen_ft_flag
+      assign ft_flag[i] = uop_info[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)].is_ft;
+      assign ft_unit[i] = uop_info[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)].ft_unit;
+      // entry_valid is program-order (FIFO fifo_data); mirror to physical entry.
+      assign entry_valid_phys[i] = entry_valid[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)];
+    end
+  endgenerate
+  // new_ft_push: a FT entry just got its copy-1 pushed this cycle -> owes copy-2.
+  // Decode it DIRECTLY from the dispatch push bus, NOT from an entry_valid rising
+  // edge: at ROB saturation a physical slot can be retired (valid->0) and re-pushed
+  // (valid->1) in the SAME cycle, so its valid never dips and a rising-edge detector
+  // silently misses the push -> copy-2 is never owed -> the entry latches got_first
+  // and hangs forever (never done, never trap). The push port for uop i lands at
+  // physical entry uop_wptr + (#earlier ports that actually push to ROB), matching
+  // dispatch's rob_address chain and multi_fifo's CHAOS_PUSH compaction.
+  always_comb begin
+    new_ft_push = '0;
+    for (int i2=0; i2<`NUM_DP_UOP; i2++) begin
+      automatic logic [`ROB_DEPTH_WIDTH-1:0] ent = uop_wptr;
+      for (int j2=0; j2<i2; j2++)
+        ent = ent + (`ROB_DEPTH_WIDTH)'(uop_valid_dp2rob[j2]);
+      if (uop_valid_dp2rob[i2] & uop_dp2rob[i2].is_ft)
+        new_ft_push[ent] = 1'b1;
+    end
+  end
+  // entry_valid_phys_q kept for waveform/debug visibility (no longer gates copy-2).
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)               entry_valid_phys_q <= '0;
+    else                      entry_valid_phys_q <= entry_valid_phys;
+  end
+`endif
+
      always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             uop_done <= '0;
@@ -215,12 +298,218 @@ module rvv_backend_rob
             end
             for (int k=0; k<`NUM_SMPORT; k++) begin
                 if (wr_valid_pu2rob[k])
+                `ifdef FAULT_TOLERANT_ON
+                    if (!ft_flag[wr_pu2rob[k].rob_entry])  // FT entries gated by comparator below
+                `endif
                     uop_done[wr_pu2rob[k].rob_entry] <= 1'b1;
+            end
+        `ifdef FAULT_TOLERANT_ON
+            for (int e=0; e<`ROB_DEPTH; e++)
+                if (ft_set_done[e]) uop_done[e] <= 1'b1;  // DMR check passed
+        `endif
+        end
+    end
+
+`ifdef FAULT_TOLERANT_ON
+  // ---- DMR result-equality helpers ------------------------------------
+  // Compare the architectural payload of two PU results / a result vs the
+  // stored res_mem copy. Only fields that retire are compared.
+    function automatic logic ft_res_eq (input PU2ROB_t a, input PU2ROB_t b);
+        ft_res_eq = (a.w_valid   === b.w_valid)
+                 && (a.w_data    === b.w_data)
+                 && (a.vsaturate === b.vsaturate)
+              `ifdef ZVE32F_ON
+                 && (a.fpexp     === b.fpexp)
+              `endif
+                 ;
+    endfunction
+    function automatic logic ft_res_eq_mem (input PU2ROB_t a, input RES_ROB_t m);
+        ft_res_eq_mem = (a.w_valid   === m.w_valid)
+                     && (a.w_data    === m.w_data)
+                     && (a.vsaturate === m.vsaturate)
+                  `ifdef ZVE32F_ON
+                     && (a.fpexp     === m.fpexp)
+                  `endif
+                     ;
+    endfunction
+
+  // ---- DMR three-branch entry comparator (combinational) --------------
+  // For each physical entry that is fault-tolerant, count the PU results
+  // landing on it THIS cycle and decide: pass (set_done) / latch first copy
+  // (set_first) / mismatch (rollback). res_mem holds the first copy until the
+  // clock edge, so branch (c) compares the incoming 2nd copy against res_mem.
+    logic [`ROB_DEPTH-1:0]                       ft_hit_any;   // >=1 result this cycle
+    logic [`ROB_DEPTH-1:0][1:0]                  ft_hit_cnt;   // 0..2 results this cycle
+    logic [`ROB_DEPTH-1:0][NUM_SMPORT_IDX-1:0]  ft_k0, ft_k1; // first / second smport idx
+    always_comb begin
+        ft_set_done  = '0;
+        ft_set_first = '0;
+        ft_rollback  = '0;
+      `ifdef FT_INJECT_ON
+        ft_inject_fire = '0;
+      `endif
+        for (int e=0; e<`ROB_DEPTH; e++) begin
+            ft_hit_any[e] = 1'b0;
+            ft_hit_cnt[e] = 2'd0;
+            ft_k0[e]      = '0;
+            ft_k1[e]      = '0;
+            for (int k=0; k<`NUM_SMPORT; k++) begin
+                if (wr_valid_pu2rob[k] && (wr_pu2rob[k].rob_entry == (`ROB_DEPTH_WIDTH)'(e))) begin
+                    if (!ft_hit_any[e]) ft_k0[e] = (NUM_SMPORT_IDX)'(k);
+                    else                ft_k1[e] = (NUM_SMPORT_IDX)'(k);
+                    ft_hit_any[e] = 1'b1;
+                    ft_hit_cnt[e] = ft_hit_cnt[e] + 2'd1;
+                end
+            end
+            if (ft_flag[e]) begin
+              `ifdef FT_INJECT_ON
+                // self-test: on the entry's FIRST real comparison (2-same-cycle, or
+                // the 2nd copy arriving after got_first), force a one-time mismatch.
+                if (!injected[e] && ((ft_hit_cnt[e] == 2'd2) ||
+                                     ((ft_hit_cnt[e] == 2'd1) && got_first[e])))
+                    ft_inject_fire[e] = 1'b1;
+              `endif
+                if (ft_hit_cnt[e] == 2'd2) begin            // branch (a): two same-cycle
+                    if (ft_res_eq(wr_pu2rob[ft_k0[e]], wr_pu2rob[ft_k1[e]])
+                      `ifdef FT_INJECT_ON
+                        && !ft_inject_fire[e]
+                      `endif
+                       )
+                        ft_set_done[e] = 1'b1;
+                    else
+                        ft_rollback[e] = 1'b1;
+                end else if (ft_hit_cnt[e] == 2'd1) begin
+                    if (!got_first[e])                       // branch (b): first copy
+                        ft_set_first[e] = 1'b1;
+                    else if (ft_res_eq_mem(wr_pu2rob[ft_k0[e]], res_mem[e]) // branch (c)
+                      `ifdef FT_INJECT_ON
+                        && !ft_inject_fire[e]
+                      `endif
+                       )
+                        ft_set_done[e] = 1'b1;
+                    else
+                        ft_rollback[e] = 1'b1;
+                end
             end
         end
     end
 
-  `ifdef ASSERT_ON 
+  // ---- DMR per-entry state: got_first / retry_cnt ---------------------
+  // got_first: set when the first copy is latched (branch b); cleared on
+  //   pass/rollback (entry resolved) or when the entry retires/flushes.
+  // retry_cnt: bumped on each rollback; reaching FT_RETRY_MAX hands off to
+  //   the existing global trap path (wired in a later step).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            got_first <= '0;
+            for (int e=0; e<`ROB_DEPTH; e++) retry_cnt[e] <= 2'd0;
+        end else if (trap_flush_rvv) begin
+            got_first <= '0;
+            for (int e=0; e<`ROB_DEPTH; e++) retry_cnt[e] <= 2'd0;
+        end else begin
+            for (int e=0; e<`ROB_DEPTH; e++) begin
+                if (ft_set_first[e])
+                    got_first[e] <= 1'b1;
+                else if (ft_set_done[e] || ft_rollback[e])
+                    got_first[e] <= 1'b0;          // entry resolved this cycle
+                if (ft_rollback[e])
+                    retry_cnt[e] <= retry_cnt[e] + 2'd1;
+                else if (ft_set_done[e])
+                    retry_cnt[e] <= 2'd0;          // clean finish, reset for entry reuse
+            end
+        end
+    end
+
+  // ---- DMR retry exhaustion -> global trap handoff (INV-5) ------------
+  // A rollback while retry_cnt already sits at the last allowed value means
+  // re-execution has failed FT_RETRY_MAX times; stop retrying and fall back to
+  // the existing global trap path (trap_flag -> retire -> trap_flush_rvv).
+  generate
+    for (i=0; i<`ROB_DEPTH; i++) begin : gen_ft_trap_req
+      assign ft_trap_req[i] = ft_rollback[i] &
+                              (retry_cnt[i] >= (`FT_RETRY_MAX-1));
+    end
+  endgenerate
+
+`ifdef FT_INJECT_ON
+  // ---- DMR self-test: one-time fault injection bookkeeping ------------
+  // injected[e] set the cycle a fault is forced; cleared when the entry slot is
+  // (re)allocated by a fresh FT push or on flush, so each entry instance is
+  // injected at most once (see config.svh: must be once, else trap loop).
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            injected <= '0;
+        else if (trap_flush_rvv)
+            injected <= '0;
+        else begin
+            for (int e=0; e<`ROB_DEPTH; e++) begin
+                if (new_ft_push[e])      injected[e] <= 1'b0; // slot reallocated
+                else if (ft_inject_fire[e]) injected[e] <= 1'b1;
+            end
+        end
+    end
+`endif
+
+  // ---- DMR reinject pending counter (physical order) ------------------
+  // copies still owed for an entry: a fresh FT push owes copy-2 (=1); a
+  // rollback invalidates both stored copies and owes both (=2). Each accepted
+  // handshake (dispatch grabbed a free RS slot) decrements; resolve/flush clears.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend[e] <= 2'd0;
+        else if (trap_flush_rvv)
+            for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend[e] <= 2'd0;
+        else begin
+            for (int e=0; e<`ROB_DEPTH; e++) begin
+                if (ft_set_done[e])
+                    ft_reinject_pend[e] <= 2'd0;               // entry resolved
+                else if (ft_rollback[e])
+                    ft_reinject_pend[e] <= 2'd2;               // resend both copies
+                else if (new_ft_push[e])
+                    ft_reinject_pend[e] <= 2'd1;               // owe copy-2
+                else
+                    ft_reinject_pend[e] <= ft_reinject_pend[e] - reinject_accept[e];
+            end
+        end
+    end
+
+  // ---- DMR multi-issue reinject arbiter (combinational) ---------------
+  // Walk entries in PROGRAM order (oldest first). For each owed copy, find a
+  // free RS push port on its target unit (mask from dispatch) and claim it.
+  // ROB is the brain: it only decides what/where; dispatch (hands) does the
+  // actual RS MUX. Multi-issue: up to NUM_DP_UOP ports per unit per cycle, so
+  // all 4 units (ALU/MUL/DIV+FDIV/FMA) fill in parallel for max replay throughput.
+    logic [`NUM_DP_UOP-1:0] ft_port_used [3:0]; // per-unit ports already claimed this cycle
+    always_comb begin
+        reinject_valid_rob2dp = '0;
+        reinject_entry_rob2dp = '0;
+        for (int e=0; e<`ROB_DEPTH; e++) reinject_accept[e] = 2'd0;
+        for (int u=0; u<4; u++)          ft_port_used[u] = '0;
+        for (int p=0; p<`ROB_DEPTH; p++) begin
+            automatic logic [`ROB_DEPTH_WIDTH-1:0] e = wind_uop_rptr[p]; // program slot p -> physical entry
+            automatic logic [1:0] u = ft_unit[e];
+            if (ft_flag[e]) begin
+                for (int c=0; c<2; c++) begin                       // up to 2 copies owed
+                    if (reinject_accept[e] < ft_reinject_pend[e]) begin
+                        // grab the lowest free, not-yet-claimed port on unit u
+                        for (int pt=0; pt<`NUM_DP_UOP; pt++) begin
+                            if ((reinject_accept[e] < ft_reinject_pend[e]) &&
+                                reinject_freeslot_dp2rob[u][pt] &&
+                                !ft_port_used[u][pt]) begin
+                                reinject_valid_rob2dp[u][pt] = 1'b1;
+                                reinject_entry_rob2dp[u][pt] = e;
+                                ft_port_used[u][pt]          = 1'b1;
+                                reinject_accept[e]           = reinject_accept[e] + 2'd1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+`endif
+
+  `ifdef ASSERT_ON
     logic [`ROB_DEPTH-1:0][`NUM_SMPORT-1:0] res_sel; // one hot code for each entry
     generate
         for (i=0; i<`ROB_DEPTH; i++) begin : gen_res_sel
@@ -228,7 +517,11 @@ module rvv_backend_rob
                 assign res_sel[i][j] = wr_valid_pu2rob[j] && (wr_pu2rob[j].rob_entry == i);
             end
 
-            `rvv_expect($onehot0(res_sel[i])) 
+            `rvv_expect($onehot0(res_sel[i])
+                      `ifdef FAULT_TOLERANT_ON
+                        || ft_flag[i]   // DMR: two same-cycle results on a FT entry is legal (branch a)
+                      `endif
+                       )
             else $error("ROB: Multiple PU results write same entry: index %d, PU %d\n", i, $sampled(res_sel[i]));
 
         end
@@ -257,8 +550,29 @@ module rvv_backend_rob
           trap_flag <= '0;
       else if (trap_flush_rvv)
           trap_flag <= '0;
-      else if (trap_valid_rmp2rob & trap_ready_rob2rmp)
+      else
+    `ifdef FAULT_TOLERANT_ON
+      // DMR adds a second set source below, so the else branch has to become a
+      // block. Wrapping only begin/end in `ifdef keeps the FT-off token stream
+      // identical to the baseline `else if (...) ...;` (INV-1) while avoiding a
+      // duplicated copy of the trap_valid_rmp2rob set in an `else arm.
+      begin
+    `endif
+      if (trap_valid_rmp2rob & trap_ready_rob2rmp)
           trap_flag[trap_rob_entry_rmp2rob] <= 1'b1;
+    `ifdef FAULT_TOLERANT_ON
+      // DMR retry exhaustion: K failed re-executions -> mark entry trapped so it
+      // retires as a trap and triggers the existing global flush fallback (INV-5).
+      // Must sit inside this block, not after the if/else chain: a statement
+      // placed after the chain also runs on the !rst_n branch, so the async reset
+      // would stop dominating and no legal FF can be inferred (DC rejects it).
+      // Must also be a SIBLING of the set above rather than an `else if`, because
+      // ft_trap_req is a single-cycle pulse -- dropping it when a trap_valid_rmp2rob
+      // lands in the same cycle would strand the entry with retry_cnt at the limit.
+      for (int e=0; e<`ROB_DEPTH; e++)
+          if (ft_trap_req[e]) trap_flag[e] <= 1'b1;
+      end
+    `endif
   end
 
   // trap ready is always 1
