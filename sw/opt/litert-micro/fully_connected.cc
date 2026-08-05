@@ -90,6 +90,75 @@ void FullyConnected(const tflite::FullyConnectedParams &params,
   }
 }
 
+void FullyConnectedPerChannel(
+    const tflite::FullyConnectedParams& params,
+    const int32_t* output_multiplier, const int32_t* output_shift,
+    const tflite::RuntimeShape& input_shape, const int8_t* input_data,
+    const tflite::RuntimeShape& filter_shape, const int8_t* filter_data,
+    const tflite::RuntimeShape& bias_shape, const int32_t* bias_data,
+    const tflite::RuntimeShape& output_shape, int8_t* output_data) {
+  (void)bias_shape;
+  const int32_t input_offset = params.input_offset;
+  // Per-channel symmetric quantization: weights zero-point is always 0, so
+  // params.weights_offset is intentionally ignored here.
+  const int32_t output_offset = params.output_offset;
+  const int32_t output_activation_min = params.quantized_activation_min;
+  const int32_t output_activation_max = params.quantized_activation_max;
+
+  const int batches =
+      tflite::FlatSizeSkipDim(output_shape, output_shape.DimensionsCount() - 1);
+  const int output_depth =
+      output_shape.Dims(output_shape.DimensionsCount() - 1);
+  const int accum_depth = filter_shape.Dims(filter_shape.DimensionsCount() - 1);
+
+  for (int b = 0; b < batches; ++b) {
+    for (int out_c = 0; out_c < output_depth; ++out_c) {
+      int d = 0;
+      int d_rem = accum_depth;
+
+      // Use m4 for 32-bit accumulation to allow headroom
+      vint32m4_t acc_v = __riscv_vmv_v_x_i32m4(0, __riscv_vsetvlmax_e32m4());
+
+      while (d_rem > 0) {
+        size_t vl = __riscv_vsetvl_e8m1(d_rem);
+        vint8m1_t in_v8 =
+            __riscv_vle8_v_i8m1(&input_data[b * accum_depth + d], vl);
+        vint8m1_t weight_v8 =
+            __riscv_vle8_v_i8m1(&filter_data[out_c * accum_depth + d], vl);
+
+        // input + input_offset
+        vint16m2_t in_v16 = __riscv_vadd_vx_i16m2(
+            __riscv_vsext_vf2_i16m2(in_v8, vl), input_offset, vl);
+        // weight, with implicit zero-point 0 (no offset add).
+        vint16m2_t weight_v16 = __riscv_vsext_vf2_i16m2(weight_v8, vl);
+
+        // acc_v += (input + input_offset) * weight
+        acc_v = __riscv_vwmacc_vv_i32m4(acc_v, in_v16, weight_v16, vl);
+
+        d += vl;
+        d_rem -= vl;
+      }
+
+      // Reduction
+      vint32m1_t zero_v = __riscv_vmv_v_x_i32m1(0, 1);
+      vint32m1_t sum_v = __riscv_vredsum_vs_i32m4_i32m1(
+          acc_v, zero_v, __riscv_vsetvlmax_e32m4());
+      int32_t acc = __riscv_vmv_x_s_i32m1_i32(sum_v);
+
+      if (bias_data) {
+        acc += bias_data[out_c];
+      }
+
+      int32_t acc_scaled = tflite::MultiplyByQuantizedMultiplier(
+          acc, output_multiplier[out_c], output_shift[out_c]);
+      acc_scaled += output_offset;
+      acc_scaled = std::max(acc_scaled, output_activation_min);
+      acc_scaled = std::min(acc_scaled, output_activation_max);
+      output_data[out_c + output_depth * b] = static_cast<int8_t>(acc_scaled);
+    }
+  }
+}
+
 namespace {
 TfLiteStatus FullyConnectedEval(TfLiteContext *context, TfLiteNode *node) {
   const auto &data = *(static_cast<const tflite::OpDataFullyConnected *>(node->user_data));
@@ -104,12 +173,22 @@ TfLiteStatus FullyConnectedEval(TfLiteContext *context, TfLiteNode *node) {
       tflite::micro::GetEvalOutput(context, node, tflite::kFullyConnectedOutputTensor);
 
   if (input->type == kTfLiteInt8 && filter->type == kTfLiteInt8) {
-    FullyConnected(
-        tflite::FullyConnectedParamsQuantized(data), tflite::micro::GetTensorShape(input),
-        tflite::micro::GetTensorData<int8_t>(input), tflite::micro::GetTensorShape(filter),
-        tflite::micro::GetTensorData<int8_t>(filter), tflite::micro::GetTensorShape(bias),
-        tflite::micro::GetOptionalTensorData<int32_t>(bias), tflite::micro::GetTensorShape(output),
-        tflite::micro::GetTensorData<int8_t>(output));
+    if (data.is_per_channel) {
+      FullyConnectedPerChannel(
+          tflite::FullyConnectedParamsQuantized(data), data.per_channel_output_multiplier,
+          data.per_channel_output_shift, tflite::micro::GetTensorShape(input),
+          tflite::micro::GetTensorData<int8_t>(input), tflite::micro::GetTensorShape(filter),
+          tflite::micro::GetTensorData<int8_t>(filter), tflite::micro::GetTensorShape(bias),
+          tflite::micro::GetOptionalTensorData<int32_t>(bias),
+          tflite::micro::GetTensorShape(output), tflite::micro::GetTensorData<int8_t>(output));
+    } else {
+      FullyConnected(
+          tflite::FullyConnectedParamsQuantized(data), tflite::micro::GetTensorShape(input),
+          tflite::micro::GetTensorData<int8_t>(input), tflite::micro::GetTensorShape(filter),
+          tflite::micro::GetTensorData<int8_t>(filter), tflite::micro::GetTensorShape(bias),
+          tflite::micro::GetOptionalTensorData<int32_t>(bias),
+          tflite::micro::GetTensorShape(output), tflite::micro::GetTensorData<int8_t>(output));
+    }
     return kTfLiteOk;
   }
 
