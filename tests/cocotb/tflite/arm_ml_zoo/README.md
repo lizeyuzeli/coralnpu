@@ -133,9 +133,9 @@ Key points:
   inference under verilator is anywhere from tens of minutes to hours,
   which would crush CI.
 - **`size = "enormous"`** plus a caller-side `--test_timeout`: bazel's
-  `enormous` cap is 3600 s, which is not necessarily enough for the
-  KWS-MicroNet tier (~140 M cycles) under verilator fastbuild; pair with
-  `--test_timeout=7200`.
+  `enormous` cap is 3600 s. The KWS-MicroNet tier (~15 M cycles) fits in
+  ~1150 s under verilator fastbuild, but the heavier models do not
+  necessarily; pair with `--test_timeout=7200` when in doubt.
 - **`dtcm_size_kbytes = 1024 / itcm_size_kbytes = 1024`**: the highmem
   image is mandatory, otherwise the model constants + tensor arena will
   not fit. This pairs with `hdl_toplevel = "RvvCoreMiniHighmemAxi"`.
@@ -288,24 +288,31 @@ explicitly).
 | `ds_cnn_small_int8` | 46 KB | 4 570 136 | 5 712 684 | 99 K | current |
 | `ad_small_int8` | 246 KB | 35 669 862 | 44 587 471 | 145 K | old base |
 | `micronet_vww2_int8` | 273 KB | 15 240 404 | 19 050 765 | 56 K | old base |
-| `kws_micronet_small_int8` | 111 KB | 140 045 588 | 175 057 087 | 1262 K | old base |
+| `kws_micronet_small_int8` | 111 KB | 14 702 087 | 18 377 711 | 132 K | current |
 
 The `old base` rows were measured before this branch was rebased onto
 current main and are kept only as an upper bound for picking timeouts.
-Re-measuring the two cheap models showed `ds_cnn_small_int8` dropping
-from 29 186 100 to 4 570 136 cycles (6.4x) while the pure-FC
-`dnn_small_int8` barely moved (-1.7%), so the gain is concentrated in
-the convolution / memory path rather than being a uniform core speedup.
-Expect the three stale rows to be optimistic-to-re-measure in the same
-direction, most of all the conv-heavy MicroNet tier.
+Re-measuring showed the gain scaling with how conv-heavy the model is:
+`kws_micronet_small_int8` dropped from 140 045 588 to 14 702 087 cycles
+(9.5x), `ds_cnn_small_int8` from 29 186 100 to 4 570 136 (6.4x), while
+the pure-FC `dnn_small_int8` barely moved (-1.7%). The gain is therefore
+concentrated in the convolution / memory path rather than being a uniform
+core speedup, and the two remaining stale rows should be read as
+optimistic-to-re-measure in the same direction.
+
+`kws_micronet_small_int8` is also the only test that exercises
+`Conv2D_Generic` (its `10x4` stem is neither 1x1 / 3x3 / 4x4); its
+reference-output match is the end-to-end evidence for that kernel.
 
 Takeaway: **the `.tflite` size only reflects parameter count; inference
 cycles are roughly `params x average feature-map area`.** The 46 KB
-`ds_cnn_small_int8` costs an order of magnitude more than the 81 KB
-`dnn_small_int8`, and the most expensive of all is the 111 KB
-`kws_micronet_small_int8`, because its 49x10 time-frequency map is
-barely downsampled and every weight is multiplied hundreds of times.
-File size ranks these models in nearly the opposite order to cost.
+`ds_cnn_small_int8` costs 16x the 81 KB `dnn_small_int8`, and the 111 KB
+`kws_micronet_small_int8` costs another 3x on top of that, because its
+49x10 time-frequency map is barely downsampled and every weight is
+multiplied hundreds of times. File size ranks these models in nearly the
+opposite order to cost. (The two `old base` rows cannot be compared
+against the current ones — `ad_small_int8` only looks like the most
+expensive model because its number predates the conv-path speedup.)
 
 ---
 
