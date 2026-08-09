@@ -29,6 +29,52 @@
 // hence it relies on FT_RETRY_MAX>1 for recovery headroom.
 //`define FT_INJECT_ON
 
+// TMR self-test — default OFF. Only meaningful with FAULT_TOLERANT_ON.
+// When ON, the ROB sweeps the entire (25 protected bit x FT_TMR_COPIES) space
+// during one simulation: each point owns a FT_TMR_INJ_PERIOD-cycle slot, is
+// corrupted for the first half and left alone for the second, then the sweep
+// stops. The regression still passing is the assertion -- it means every one of
+// those points was outvoted. One point at a time is the whole premise: TMR
+// corrects a single fault, and injecting two copies of the same bit at once is
+// a defeat of the scheme, not a test of it.
+// The period must exceed one test binary (~210 cycles in rvv_arithmetic), or a
+// point can spend its whole window inside the reset between two ELFs and get
+// swept past without ever meeting real traffic.
+//`define FT_TMR_INJECT_ON
+`ifndef FT_TMR_INJ_PERIOD
+  `define FT_TMR_INJ_PERIOD 512
+`endif
+
+// TMR replication factor for the ROB baseline control state (uop_done /
+// trap_flag / entry_valid / trap_ready). Three is the only value the majority
+// voter `ft_voter` implements; the macro exists to name the copies, not to be
+// swept.
+`define FT_TMR_COPIES 3
+
+// TMR is deliberate redundancy: the three copies are logically equivalent, so
+// any optimizer may legally collapse them back into one and silently delete
+// the fault tolerance -- the synthesis report looks clean either way. Vendors
+// spell the "do not" differently, so select by tool macro. Expands to nothing
+// in simulation, leaving the Verilator/VCS parse path untouched (INV-1).
+// FT_SYN_* must be passed explicitly by the synthesis script (+define+): the
+// tools' own built-in macro names differ and are not stable (Vivado does not
+// necessarily define XILINX), so guessing them is worse than being told. With
+// none of them set we fall back to the generic dont_touch, which DC/FC,
+// Vivado and recent Genus all accept.
+`ifdef SYNTHESIS
+  `ifdef FT_SYN_VIVADO                                        // AMD Vivado
+    `define FT_KEEP (* dont_touch = "true", keep_hierarchy = "yes" *)
+  `elsif FT_SYN_GENUS                                         // Cadence Genus
+    `define FT_KEEP (* preserve *)
+  `elsif FT_SYN_QUARTUS                                       // Intel Quartus
+    `define FT_KEEP (* preserve, dont_merge, noprune *)
+  `else                                                       // Synopsys DC/FC and generic
+    `define FT_KEEP (* dont_touch = "true" *)
+  `endif
+`else
+  `define FT_KEEP
+`endif
+
 // number of scalar core issue lane
 `define ISSUE_LANE              4
 

@@ -127,6 +127,7 @@ chisel_library(
         "//hdl/verilog/rvv/common:dff.sv",
         "//hdl/verilog/rvv/common:edff.sv",
         "//hdl/verilog/rvv/common:edff_2d.sv",
+        "//hdl/verilog/rvv/common:ft_voter.sv",
         "//hdl/verilog/rvv/common:multi_fifo.sv",
         "//hdl/verilog/rvv/common:intdivider.sv",
         "//hdl/verilog/rvv/design:Aligner.sv",

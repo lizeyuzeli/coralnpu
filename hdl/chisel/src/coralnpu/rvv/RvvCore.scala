@@ -554,6 +554,7 @@ class RvvCoreWrapper(p: Parameters)
   addResource("hdl/verilog/rvv/common/dff.sv")
   addResource("hdl/verilog/rvv/common/edff.sv")
   addResource("hdl/verilog/rvv/common/edff_2d.sv")
+  addResource("hdl/verilog/rvv/common/ft_voter.sv")
   addResource("hdl/verilog/rvv/common/multi_fifo.sv")
   addResource("hdl/verilog/rvv/common/intdivider.sv")
 

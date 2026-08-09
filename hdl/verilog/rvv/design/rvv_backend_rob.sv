@@ -118,12 +118,26 @@ module rvv_backend_rob
     logic     [`ROB_DEPTH-1:0]          ft_set_first;   // first copy arrived this cycle -> latch, suppress done
     logic     [`ROB_DEPTH-1:0]          ft_rollback;    // DMR mismatch this cycle -> resend both copies
   // reinject bookkeeping (physical order)
-    logic     [`ROB_DEPTH-1:0]          entry_valid_phys;   // entry_valid mirrored to physical order
-    logic     [`ROB_DEPTH-1:0]          entry_valid_phys_q; // registered, for rising-edge push detect
     logic     [`ROB_DEPTH-1:0]          new_ft_push;        // FT entry first becomes valid -> owe copy-2
     logic     [`ROB_DEPTH-1:0][1:0]     reinject_accept;    // copies dispatched this cycle per entry (for pend decrement)
   // retry-exhaustion handoff: K rollbacks reached -> fall back to global trap (INV-5)
     logic     [`ROB_DEPTH-1:0]          ft_trap_req;        // this cycle's rollback would hit FT_RETRY_MAX
+  // ---- TMR of the ROB baseline control state (25 bit) -----------------
+  // uop_done / trap_flag / entry_valid / trap_ready are what the ROB state
+  // machine runs on: a single upset in any of them is enough to derail it
+  // (it is also the only analysis module where a `seu` produced SDC-critical
+  // outcomes). Each is stored FT_TMR_COPIES times and read back through a
+  // majority voter; the ORIGINAL name is kept for the voted net, so none of
+  // the readers further down change. This is register-only TMR -- the D-side
+  // logic cone stays shared, because what is being modelled is the control
+  // bits themselves flipping, not the logic that computes them.
+  // entry_valid lives inside multi_fifo's `mem`, so it is triplicated by
+  // instantiating the fifo three times (the IP itself is not touched).
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  uop_done_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  trap_flag_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0]                  trap_ready_tmr;
+             logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  entry_valid_tmr;      // fifo_data per copy
+             logic [`FT_TMR_COPIES-1:0][`NUM_RT_UOP-1:0] uop_valid_rob2rt_tmr; // dataout per copy
 `ifdef FT_INJECT_ON
   // self-test: force a one-time mismatch per FT entry to exercise the
   // duplicate->compare->rollback->retry->recover chain (see config.svh).
@@ -144,6 +158,97 @@ module rvv_backend_rob
 
     genvar                              i,j;
 // ---code start------------------------------------------------------
+`ifdef FT_TMR_INJECT_ON
+  // ---- TMR self-test sweeper ---------------------------------------
+  // Walks the whole (protected bit x copy) space in one simulation, one point
+  // at a time: 25 bits = uop_done[8] + trap_flag[8] + trap_ready[1] +
+  // entry_valid[8], times FT_TMR_COPIES. A point is corrupted for the first
+  // half of its period and left alone for the second half, so each point tests
+  // two things in turn -- the voter masking a live single-copy fault, and the
+  // scrub pulling the beaten copy back to the majority once the fault stops.
+  //
+  // The injected value is the complement of the VOTED bit rather than a flip of
+  // the copy's own bit. A flip can land on the value the copy was going to hold
+  // anyway, which silently injects nothing and leaves that sweep point untested;
+  // complement-of-majority is a guaranteed divergence at every point.
+  localparam int FT_TMR_INJ_BITS   = 3*`ROB_DEPTH + 1;
+  localparam int FT_TMR_INJ_POINTS = FT_TMR_INJ_BITS*`FT_TMR_COPIES;
+  localparam int FT_TMR_PT_W       = $clog2(FT_TMR_INJ_POINTS+1);
+  localparam int FT_TMR_CNT_W      = $clog2(`FT_TMR_INJ_PERIOD);
+
+    // Free-running, deliberately NOT reset: the fixture pulses rst_n before
+    // every ELF (~210 cycles apart), so a reset-able sweep counter never gets
+    // past point 1 and the whole self-test silently degenerates into "corrupt
+    // bit 0 forever". Initialised at declaration instead; this block is
+    // simulation-only, so there is no flop to infer.
+    logic [FT_TMR_CNT_W-1:0]        ft_tmr_inj_cnt = '0;
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_pt  = '0;
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_bit;   // 0..24, which protected bit
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_copy;  // which of the three copies
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_ent;   // entry index within its group
+    logic                           ft_tmr_inj_act;   // corrupting right now
+    logic                           ft_tmr_inj_act_q;
+    logic                           ft_tmr_inj_done_q = 1'b0;
+    logic                           ft_tmr_hit_done;
+    logic                           ft_tmr_hit_trap;
+    logic                           ft_tmr_hit_ready;
+    logic                           ft_tmr_hit_valid;
+
+  always_ff @(posedge clk) begin
+      if (ft_tmr_inj_pt < FT_TMR_INJ_POINTS) begin
+          if (ft_tmr_inj_cnt == `FT_TMR_INJ_PERIOD-1) begin
+              ft_tmr_inj_cnt <= '0;
+              ft_tmr_inj_pt  <= ft_tmr_inj_pt + 1'b1;
+          end
+          else
+              ft_tmr_inj_cnt <= ft_tmr_inj_cnt + 1'b1;
+      end
+  end
+
+  assign ft_tmr_inj_act  = (ft_tmr_inj_pt < FT_TMR_INJ_POINTS) &&
+                           (ft_tmr_inj_cnt < (`FT_TMR_INJ_PERIOD/2));
+  assign ft_tmr_inj_copy = ft_tmr_inj_pt % `FT_TMR_COPIES;
+  assign ft_tmr_inj_bit  = ft_tmr_inj_pt / `FT_TMR_COPIES;
+  assign ft_tmr_inj_ent  = (ft_tmr_inj_bit <   `ROB_DEPTH) ?  ft_tmr_inj_bit
+                         : (ft_tmr_inj_bit < 2*`ROB_DEPTH) ?  ft_tmr_inj_bit -   `ROB_DEPTH
+                                                           :  ft_tmr_inj_bit - (2*`ROB_DEPTH+1);
+
+  assign ft_tmr_hit_done  = ft_tmr_inj_act && (ft_tmr_inj_bit <   `ROB_DEPTH);
+  assign ft_tmr_hit_trap  = ft_tmr_inj_act && (ft_tmr_inj_bit >=  `ROB_DEPTH)
+                                           && (ft_tmr_inj_bit < 2*`ROB_DEPTH);
+  assign ft_tmr_hit_ready = ft_tmr_inj_act && (ft_tmr_inj_bit == 2*`ROB_DEPTH);
+  assign ft_tmr_hit_valid = ft_tmr_inj_act && (ft_tmr_inj_bit >  2*`ROB_DEPTH);
+
+  // The three flop groups are scrubbed, so once a point's injection window
+  // closes they must re-converge on the next clock. Checking that here is what
+  // separates "the voter hid the fault" from "the fault was also repaired" --
+  // the regression result alone cannot tell those apart. entry_valid is absent
+  // because its point is applied on the voter input, not on the fifo mem, so
+  // its copies never actually diverge (see the fifo instantiation below).
+  always_ff @(posedge clk) begin
+      ft_tmr_inj_act_q <= ft_tmr_inj_act;
+      if (rst_n && !ft_tmr_inj_act && !ft_tmr_inj_act_q) begin
+          if ((uop_done_tmr[0]  != uop_done_tmr[1])  || (uop_done_tmr[1]  != uop_done_tmr[2]) ||
+              (trap_flag_tmr[0] != trap_flag_tmr[1]) || (trap_flag_tmr[1] != trap_flag_tmr[2]) ||
+              (trap_ready_tmr[0]!= trap_ready_tmr[1])|| (trap_ready_tmr[1]!= trap_ready_tmr[2]))
+              $error("FT_TMR: copies failed to scrub back after point %0d", ft_tmr_inj_pt);
+      end
+  end
+
+  // A silent pass means nothing unless the sweep actually reached the last
+  // point: a run that ends mid-sweep looks exactly like a clean one. The point
+  // trace plus the completion line are what make the regression result evidence
+  // -- one line per point, 75 in total, so it stays readable in the test log.
+  always_ff @(posedge clk) begin
+      if ((ft_tmr_inj_pt == FT_TMR_INJ_POINTS) && !ft_tmr_inj_done_q) begin
+          ft_tmr_inj_done_q <= 1'b1;
+          $display("FT_TMR: sweep complete, %0d points covered", FT_TMR_INJ_POINTS);
+      end
+      else if (ft_tmr_inj_act && (ft_tmr_inj_cnt == '0))
+          $display("FT_TMR: point %0d (bit %0d copy %0d)", ft_tmr_inj_pt, ft_tmr_inj_bit, ft_tmr_inj_copy);
+  end
+
+`endif
   // Uop info FIFO
     multi_fifo #(
         .T            (DP2ROB_t),
@@ -182,6 +287,94 @@ module rvv_backend_rob
   // set if DP push uop into ROB
   // clear if RT pop uop from ROB
   // reset once flush ROB
+`ifdef FAULT_TOLERANT_ON
+  // TMR of entry_valid. Those 8 bit live inside multi_fifo's `mem`, and the IP
+  // is deliberately not modified, so the fifo is instantiated FT_TMR_COPIES
+  // times instead and its outputs are voted. The instance is tiny (T=logic:
+  // 8 b of mem + 10 b of pointers), so the two extra copies cost ~36 FF and
+  // come with independent pointers -- which incidentally protects half of the
+  // ROB's fifo bookkeeping for free.
+  // BOTH used outputs must be voted, not just fifo_data: `dataout` gates the
+  // retire valids and trap_in, so leaving it unvoted would protect the
+  // forwarding view of entry_valid while the retire path stayed exposed.
+  // Every copy sees identical push/pop/clear inputs -- pop is derived from the
+  // VOTED dataout -- so the three pointer sets cannot drift apart.
+  // Note: unlike the flops below, a fifo copy cannot be scrubbed from the
+  // majority (that would mean writing into the IP's mem); an upset bit is
+  // outvoted but persists until POP_CLEAR clears the slot on retire.
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_uop_valid_fifo_tmr
+      `FT_KEEP multi_fifo #(
+        .T            (logic),
+        .M            (`NUM_DP_UOP),
+        .N            (`NUM_RT_UOP),
+        .DEPTH        (`ROB_DEPTH),
+        .POP_CLEAR    (1'b1),
+        .ASYNC_RSTN   (1'b1),
+        .CHAOS_PUSH   (1'b1),
+        .FULL_PUSH    (1'b1)
+      ) u_uop_valid_fifo (
+      // global
+        .clk          (clk),
+        .rst_n        (rst_n),
+      // push side
+        .push         (uop_valid_dp2rob),
+        .datain       (uop_valid_dp2rob),
+        .full         (),
+        .almost_full  (),
+      // pop side
+        .pop          (rd_valid_rob2rt & rd_ready_rt2rob),
+        .dataout      (uop_valid_rob2rt_tmr[i]),
+        .empty        (),
+        .almost_empty (),
+      // fifo info
+        .clear        (trap_flush_rvv),
+        .fifo_data    (entry_valid_tmr[i]),
+        .wptr         (),
+        .rptr         (),
+        .entry_count  ()
+      );
+    end
+  endgenerate
+
+`ifdef FT_TMR_INJECT_ON
+  // entry_valid's sweep points are applied here, on the voter input, because the
+  // bits themselves are inside the untouched IP's mem. For the voter this is
+  // indistinguishable from a corrupted mem bit; what it does not reproduce is
+  // the persistence of a real mem upset, which would survive until POP_CLEAR
+  // rather than until the injection window closes. That gap is the price of not
+  // forking multi_fifo, and it is on the "outvoted" side of the test, not the
+  // "detected" side -- see INV-6 in the FI plan for the same caveat.
+  // The corrupted value is taken as the complement of the NEXT copy's bit, not
+  // of the voter output: the voter output feeds back here, so complementing it
+  // would close a combinational loop. Copies never diverge on their own, so the
+  // neighbour carries the same value the majority does.
+    logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0] entry_valid_tmr_inj;
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_entry_valid_tmr_inj
+      always_comb begin
+          entry_valid_tmr_inj[i] = entry_valid_tmr[i];
+          if (ft_tmr_hit_valid && (ft_tmr_inj_copy==i))
+              entry_valid_tmr_inj[i][ft_tmr_inj_ent] =
+                  ~entry_valid_tmr[(i+1)%`FT_TMR_COPIES][ft_tmr_inj_ent];
+      end
+    end
+  endgenerate
+  `FT_KEEP ft_voter #(.WIDTH(`ROB_DEPTH))  u_vote_entry_valid (
+        .d            (entry_valid_tmr_inj),
+        .y            (entry_valid)
+  );
+`else
+  `FT_KEEP ft_voter #(.WIDTH(`ROB_DEPTH))  u_vote_entry_valid (
+        .d            (entry_valid_tmr),
+        .y            (entry_valid)
+  );
+`endif
+  `FT_KEEP ft_voter #(.WIDTH(`NUM_RT_UOP)) u_vote_uop_valid_rob2rt (
+        .d            (uop_valid_rob2rt_tmr),
+        .y            (uop_valid_rob2rt)
+  );
+`else
     multi_fifo #(
         .T            (logic),
         .M            (`NUM_DP_UOP),
@@ -212,6 +405,7 @@ module rvv_backend_rob
         .rptr         (),
         .entry_count  ()
     );
+`endif
 
   // update PU result to result memory
     always_ff @(posedge clk, negedge rst_n) begin
@@ -257,8 +451,6 @@ module rvv_backend_rob
     for (i=0; i<`ROB_DEPTH; i++) begin : gen_ft_flag
       assign ft_flag[i] = uop_info[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)].is_ft;
       assign ft_unit[i] = uop_info[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)].ft_unit;
-      // entry_valid is program-order (FIFO fifo_data); mirror to physical entry.
-      assign entry_valid_phys[i] = entry_valid[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)];
     end
   endgenerate
   // new_ft_push: a FT entry just got its copy-1 pushed this cycle -> owes copy-2.
@@ -279,13 +471,60 @@ module rvv_backend_rob
         new_ft_push[ent] = 1'b1;
     end
   end
-  // entry_valid_phys_q kept for waveform/debug visibility (no longer gates copy-2).
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)               entry_valid_phys_q <= '0;
-    else                      entry_valid_phys_q <= entry_valid_phys;
-  end
 `endif
 
+`ifdef FAULT_TOLERANT_ON
+  // TMR copies of uop_done. Every copy runs the same next-state logic off the
+  // VOTED value, so the D-side cone stays shared (register-only TMR) and the
+  // three copies cannot diverge on their own.
+  // The unconditional `uop_done_tmr[i] <= uop_done` is the scrub, and it is
+  // what makes a `seu` recoverable rather than merely outvoted: without it a
+  // bit that no branch below writes would implicitly hold ITS OWN value, so an
+  // upset copy would stay wrong until that entry happens to be written again,
+  // and a second upset anywhere in those 8 bit would break the majority. With
+  // it, the copy is rewritten from the majority on the very next clock.
+  // The later assignments in this block override it bit-wise (NBA last-write),
+  // exactly as they override the implicit hold in the FT-off version below.
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_uop_done_tmr
+     always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            uop_done_tmr[i] <= '0;
+        else if (trap_flush_rvv)
+            uop_done_tmr[i] <= '0;
+        else begin
+            uop_done_tmr[i] <= uop_done;               // scrub from the majority
+            for (int k=0; k<`NUM_RT_UOP; k++) begin
+                if (rd_valid_rob2rt[k] && rd_ready_rt2rob[k])
+                    uop_done_tmr[i][wind_uop_rptr[k]] <= 1'b0;
+            end
+            for (int k=0; k<`NUM_SMPORT; k++) begin
+                if (wr_valid_pu2rob[k])
+                    if (!ft_flag[wr_pu2rob[k].rob_entry])  // FT entries gated by comparator below
+                    uop_done_tmr[i][wr_pu2rob[k].rob_entry] <= 1'b1;
+            end
+            for (int e=0; e<`ROB_DEPTH; e++)
+                if (ft_set_done[e]) uop_done_tmr[i][e] <= 1'b1;  // DMR check passed
+`ifdef FT_TMR_INJECT_ON
+            // Sweep point: last in the chain so it beats the scrub and every
+            // functional write, i.e. it models the flop itself being held wrong
+            // rather than a bad value arriving on its D. Kept inside the else
+            // branch so reset and flush still dominate -- a point that lands
+            // on a flush cycle simply goes untested that cycle, out of the
+            // FT_TMR_INJ_PERIOD/2 cycles its window is wide.
+            if (ft_tmr_hit_done && (ft_tmr_inj_copy==i))
+                uop_done_tmr[i][ft_tmr_inj_ent] <= ~uop_done[ft_tmr_inj_ent];
+`endif
+        end
+      end
+    end
+  endgenerate
+
+  `FT_KEEP ft_voter #(.WIDTH(`ROB_DEPTH)) u_vote_uop_done (
+        .d            (uop_done_tmr),
+        .y            (uop_done)
+  );
+`else
      always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             uop_done <= '0;
@@ -298,17 +537,11 @@ module rvv_backend_rob
             end
             for (int k=0; k<`NUM_SMPORT; k++) begin
                 if (wr_valid_pu2rob[k])
-                `ifdef FAULT_TOLERANT_ON
-                    if (!ft_flag[wr_pu2rob[k].rob_entry])  // FT entries gated by comparator below
-                `endif
                     uop_done[wr_pu2rob[k].rob_entry] <= 1'b1;
             end
-        `ifdef FAULT_TOLERANT_ON
-            for (int e=0; e<`ROB_DEPTH; e++)
-                if (ft_set_done[e]) uop_done[e] <= 1'b1;  // DMR check passed
-        `endif
         end
     end
+`endif
 
 `ifdef FAULT_TOLERANT_ON
   // ---- DMR result-equality helpers ------------------------------------
@@ -545,35 +778,61 @@ module rvv_backend_rob
   // trap flag
   // write trap to ROB when trap occurs
   // flush all fifo when the uop triggering trap is the oldest uop in ROB
+`ifdef FAULT_TOLERANT_ON
+  // TMR copies of trap_flag, same shape as uop_done above: shared D-side cone
+  // fed from the voted value, plus the scrub assignment that lets a single
+  // upset be corrected instead of merely outvoted.
+  // Two set sources have to live in this one block, and both have to stay
+  // INSIDE the else arm rather than after the if/else chain: a statement after
+  // the chain also executes on the !rst_n branch, so the async reset would stop
+  // dominating and no legal flop can be inferred (DC rejects it). They must
+  // also be siblings rather than `else if`, because ft_trap_req is a
+  // single-cycle pulse -- dropping it when a trap_valid_rmp2rob lands in the
+  // same cycle would strand the entry with retry_cnt at the limit.
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_trap_flag_tmr
+      always_ff @(posedge clk or negedge rst_n) begin
+          if (!rst_n)
+              trap_flag_tmr[i] <= '0;
+          else if (trap_flush_rvv)
+              trap_flag_tmr[i] <= '0;
+          else begin
+              trap_flag_tmr[i] <= trap_flag;           // scrub from the majority
+              if (trap_valid_rmp2rob & trap_ready_rob2rmp)
+                  trap_flag_tmr[i][trap_rob_entry_rmp2rob] <= 1'b1;
+              // DMR retry exhaustion: K failed re-executions -> mark entry
+              // trapped so it retires as a trap and triggers the existing
+              // global flush fallback (INV-5).
+              for (int e=0; e<`ROB_DEPTH; e++)
+                  if (ft_trap_req[e]) trap_flag_tmr[i][e] <= 1'b1;
+`ifdef FT_TMR_INJECT_ON
+              // Sweep point, same placement rationale as uop_done above. This
+              // is the sharpest of the four: a stuck trap_flag on a live entry
+              // retires it as a trap and flushes the machine, so if the voter
+              // ever let one copy through, the regression would not merely
+              // mismatch, it would take the trap path.
+              if (ft_tmr_hit_trap && (ft_tmr_inj_copy==i))
+                  trap_flag_tmr[i][ft_tmr_inj_ent] <= ~trap_flag[ft_tmr_inj_ent];
+`endif
+          end
+      end
+    end
+  endgenerate
+
+  `FT_KEEP ft_voter #(.WIDTH(`ROB_DEPTH)) u_vote_trap_flag (
+        .d            (trap_flag_tmr),
+        .y            (trap_flag)
+  );
+`else
   always_ff @(posedge clk or negedge rst_n) begin
       if (!rst_n)
           trap_flag <= '0;
       else if (trap_flush_rvv)
           trap_flag <= '0;
-      else
-    `ifdef FAULT_TOLERANT_ON
-      // DMR adds a second set source below, so the else branch has to become a
-      // block. Wrapping only begin/end in `ifdef keeps the FT-off token stream
-      // identical to the baseline `else if (...) ...;` (INV-1) while avoiding a
-      // duplicated copy of the trap_valid_rmp2rob set in an `else arm.
-      begin
-    `endif
-      if (trap_valid_rmp2rob & trap_ready_rob2rmp)
+      else if (trap_valid_rmp2rob & trap_ready_rob2rmp)
           trap_flag[trap_rob_entry_rmp2rob] <= 1'b1;
-    `ifdef FAULT_TOLERANT_ON
-      // DMR retry exhaustion: K failed re-executions -> mark entry trapped so it
-      // retires as a trap and triggers the existing global flush fallback (INV-5).
-      // Must sit inside this block, not after the if/else chain: a statement
-      // placed after the chain also runs on the !rst_n branch, so the async reset
-      // would stop dominating and no legal FF can be inferred (DC rejects it).
-      // Must also be a SIBLING of the set above rather than an `else if`, because
-      // ft_trap_req is a single-cycle pulse -- dropping it when a trap_valid_rmp2rob
-      // lands in the same cycle would strand the entry with retry_cnt at the limit.
-      for (int e=0; e<`ROB_DEPTH; e++)
-          if (ft_trap_req[e]) trap_flag[e] <= 1'b1;
-      end
-    `endif
   end
+`endif
 
   // trap ready is always 1
   assign trap_ready_rob2rmp = 1'b1;
@@ -610,7 +869,34 @@ module rvv_backend_rob
   
   // trap handle ready and flush signal
   assign trap_in = uop_valid_rob2rt[0] & rd_rob2rt[0].trap_flag & rd_ready_rt2rob[0];
+`ifdef FAULT_TOLERANT_ON
+  // TMR of the trap handshake flop -- one bit, and the most consequential one
+  // in the ROB: it drives trap_flush_rvv, which flushes the whole backend, and
+  // its `.e(1'b1)` means it is written every single cycle. Measured on the bare
+  // core, an upset here goes straight to DUE-hang.
+  // The d input feeds back the VOTED output, not each copy's own q, so the
+  // three copies can never latch different halves of the two-cycle handshake
+  // and an upset copy is pulled back into line on the next clock -- the same
+  // self-correcting property the scrub gives the vectors above, for free.
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_trap_ready_tmr
+`ifdef FT_TMR_INJECT_ON
+      // Sweep point. edff is IP, so the corruption goes on the D input instead
+      // of the flop -- with `.e(1'b1)` the flop is written every cycle, so a
+      // held-complement D is indistinguishable at q from a held-wrong flop.
+      `FT_KEEP edff trap_ready (.q(trap_ready_tmr[i]), .d((trap_in&(!trap_ready_rvv2rvs)) ^ (ft_tmr_hit_ready && (ft_tmr_inj_copy==i))), .e(1'b1), .clk(clk), .rst_n(rst_n));
+`else
+      `FT_KEEP edff trap_ready (.q(trap_ready_tmr[i]), .d(trap_in&(!trap_ready_rvv2rvs)), .e(1'b1), .clk(clk), .rst_n(rst_n));
+`endif
+    end
+  endgenerate
+  `FT_KEEP ft_voter #(.WIDTH(1)) u_vote_trap_ready (
+        .d            (trap_ready_tmr),
+        .y            (trap_ready_rvv2rvs)
+  );
+`else
   edff trap_ready (.q(trap_ready_rvv2rvs), .d(trap_in&(!trap_ready_rvv2rvs)), .e(1'b1), .clk(clk), .rst_n(rst_n));
+`endif
   assign trap_flush_rvv = trap_in||trap_ready_rvv2rvs; // flush 2 cycles
 
   // bypass ROB info to Dispatch
