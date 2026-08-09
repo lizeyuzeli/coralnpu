@@ -14,7 +14,7 @@
 
 """Module-level fault-injection campaign driver for the RVV core.
 
-Runs the 4-module x 3-fault-type vulnerability matrix against one model. Each
+Runs the 4-sub-module x 3-fault-type vulnerability matrix against one model. Each
 (module, fault_type) pair is one experiment group: FI_N runs, each with a
 single fault at a random bit (uniform over the module's whole fault space) and
 a random cycle. Outcomes are bucketed into the three-layer / six-bucket
@@ -22,7 +22,10 @@ taxonomy (see fi_utils). Per-run rows go to fi_results.csv; per-group layer &
 bucket shares go to fi_summary.csv and the log.
 
 Env knobs (all optional):
-    FI_MODULE      decode_path | compute_ctrl | execute | storage | all  (all)
+    FI_MODULE      decode_path | compute_ctrl | execute | storage        (all)
+                   'all'   = those four, the analysis matrix
+                   'every' = plus the diagnostics (rob_data, fifo_ptr),
+                             which are otherwise reachable only by name
     FI_FAULT_TYPE  seu | set | stuck | all                               (all)
     FI_STUCK_VAL   0 | 1   (polarity for the stuck model)                (0)
     FI_N           runs per group                                        (50)
@@ -41,6 +44,7 @@ Design notes:
 import csv
 import os
 import random
+import re
 
 import cocotb
 import numpy as np
@@ -112,11 +116,12 @@ async def _run_once(dut, fixture, elf_path, input_data, expected_output,
     cycles, halted, faulted, hung = await _wait_for_outcome(
         dut, timeout_cycles)
 
+    # cancel(), not kill(): the latter is deprecated in cocotb 2.0.
     if inject_task is not None and not inject_task.done():
-        inject_task.kill()
+        inject_task.cancel()
     for t in spawned_holders:
         if not t.done():
-            t.kill()
+            t.cancel()
 
     status = None
     actual_output = None
@@ -157,9 +162,16 @@ def _locate_global_bit(targets, global_bit):
     raise IndexError(f"global_bit {global_bit} exceeds fault space {acc}")
 
 
-def _make_inject_cb(target, local_bit, inject_cycle, fault_type, stuck_val):
-    """Build the coroutine that waits `inject_cycle` then performs the flip."""
+def _make_inject_cb(target, local_bit, inject_cycle, fault_type, stuck_val,
+                    set_timeout=None):
+    """Build the coroutine that waits `inject_cycle` then performs the flip.
+
+    Returns (cb, state). `state["fired"]` reports whether the fault was
+    actually expressed; only `set` can come back False, when the cell is never
+    written again before the run ends (see fi_utils.transient_bit_flip)."""
     signal = target["handle"]
+    e_handle, _ = fi_utils.enable_handles(target)
+    state = {"fired": True}
 
     async def _cb(dut, clock, holders):
         if inject_cycle > 0:
@@ -167,14 +179,16 @@ def _make_inject_cb(target, local_bit, inject_cycle, fault_type, stuck_val):
         if fault_type == "seu":
             await fi_utils.persistent_bit_flip(clock, signal, local_bit)
         elif fault_type == "set":
-            await fi_utils.transient_bit_flip(clock, signal, local_bit)
+            await fi_utils.transient_bit_flip(
+                clock, signal, local_bit, e_handle=e_handle,
+                timeout_cycles=set_timeout, state=state)
         elif fault_type == "stuck":
             holders.append(cocotb.start_soon(
                 fi_utils.permanent_stuck_at(clock, signal, local_bit,
                                             stuck_val)))
         else:
             raise ValueError(f"unknown fault_type '{fault_type}'")
-    return _cb
+    return _cb, state
 
 
 # Per-run CSV. Columns carry the group key (module + fault_type), the exact
@@ -183,18 +197,25 @@ def _make_inject_cb(target, local_bit, inject_cycle, fault_type, stuck_val):
 RESULT_FIELDS = [
     "model", "module", "ft_scheme", "fault_type", "stuck_val",
     "run_id", "tag", "target_path", "local_bit", "global_bit",
-    "fault_space_bits", "inject_cycle", "halt_cycle",
+    "fault_space_bits", "bit_live", "inject_cycle", "fault_fired", "halt_cycle",
     "halted", "faulted", "hung", "status",
     "output_bitexact", "argmax_match", "outcome",
 ]
 
 SUMMARY_FIELDS = [
     "model", "module", "ft_scheme", "fault_type", "stuck_val", "n_runs",
-    # three-layer shares
+    # three-layer shares over the whole fault space (raw AVF)
     "MASKED_pct", "SDC_pct", "DUE_pct",
     # six-bucket shares
     "MASKED_b_pct", "SDC-benign_pct", "SDC-critical_pct",
     "DUE-hang_pct", "DUE-crash_pct", "DUE-detected_pct",
+    # conditional AVF: same layers, but normalised over the bits this workload
+    # actually exercises (see _liveness_watcher)
+    "live_bits", "live_frac_pct", "n_runs_live",
+    "MASKED_pct_live", "SDC_pct_live", "DUE_pct_live",
+    # runs whose fault was never expressed (set on a cell never written again);
+    # they are NOT evidence of tolerance and are excluded from *_fired shares
+    "n_runs_not_fired", "MASKED_pct_fired", "SDC_pct_fired", "DUE_pct_fired",
 ]
 
 
@@ -202,11 +223,24 @@ def _pct(n, total):
     return round(100.0 * n / total, 2) if total else 0.0
 
 
-def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts):
-    n = sum(counts.values())
+def _layers(counts):
     layer = {"MASKED": 0, "SDC": 0, "DUE": 0}
     for bucket, c in counts.items():
         layer[fi_utils.LAYER_OF[bucket]] += c
+    return layer
+
+
+def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
+                 counts_live=None, live_bits=0, space=0,
+                 counts_fired=None, n_not_fired=0):
+    n = sum(counts.values())
+    layer = _layers(counts)
+    counts_live = counts_live or {}
+    n_live = sum(counts_live.values())
+    layer_live = _layers(counts_live)
+    counts_fired = counts_fired if counts_fired is not None else counts
+    n_fired = sum(counts_fired.values())
+    layer_fired = _layers(counts_fired)
     return {
         "model": model, "module": module, "ft_scheme": ft_scheme,
         "fault_type": fault_type, "stuck_val": stuck_val, "n_runs": n,
@@ -219,7 +253,215 @@ def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts):
         "DUE-hang_pct": _pct(counts["DUE-hang"], n),
         "DUE-crash_pct": _pct(counts["DUE-crash"], n),
         "DUE-detected_pct": _pct(counts["DUE-detected"], n),
+        "live_bits": live_bits, "live_frac_pct": _pct(live_bits, space),
+        "n_runs_live": n_live,
+        "MASKED_pct_live": _pct(layer_live["MASKED"], n_live),
+        "SDC_pct_live": _pct(layer_live["SDC"], n_live),
+        "DUE_pct_live": _pct(layer_live["DUE"], n_live),
+        "n_runs_not_fired": n_not_fired,
+        "MASKED_pct_fired": _pct(layer_fired["MASKED"], n_fired),
+        "SDC_pct_fired": _pct(layer_fired["SDC"], n_fired),
+        "DUE_pct_fired": _pct(layer_fired["DUE"], n_fired),
     }
+
+
+# ---------------------------------------------------------------------------
+# Bit liveness / dead silicon (A-1.5).
+#
+# A uniform pick over the fault space spends most of its budget on bits this
+# workload never exercises (div / falu / pmtrdt are ~60% of the execute space
+# and this keyword-spotting model never issues those ops). Those bits are
+# MASKED by construction, so the raw AVF is a real number about THIS workload
+# but a misleading one about the hardware: it moves whenever the unused-unit
+# area moves, for reasons that have nothing to do with vulnerability.
+#
+# So we report both. Liveness is sampled on the golden run -- which the
+# campaign already performs for the determinism gate -- by periodically
+# snapshotting every target and OR-ing value ^ first_value. A bit that never
+# toggles over the whole uninjected run is dead for this workload. Conditional
+# AVF then normalises over the live bits only, and both numbers ship together.
+#
+# This observes the golden trajectory, it does not alter it: reads only.
+# ---------------------------------------------------------------------------
+_DEFAULT_LIVENESS_PERIOD = 200
+
+
+async def _liveness_watcher(clock, targets, period, out):
+    """Snapshot targets every `period` cycles; accumulate per-bit toggle masks
+    into `out` (list of ints, one per target, index-aligned with `targets`)."""
+    first = [None] * len(targets)
+    while True:
+        await ClockCycles(clock, period)
+        for i, t in enumerate(targets):
+            v = fi_utils.read_int(t["handle"])
+            if v is None:
+                continue
+            if first[i] is None:
+                first[i] = v
+            else:
+                out[i] |= (v ^ first[i])
+
+
+# ---------------------------------------------------------------------------
+# Deposit positive control (A-1.1). Separate entry point from run_campaign:
+# this measures the INSTRUMENT, not the design, and must never feed the
+# vulnerability data. One short simulation, many probes, no run-to-halt --
+# ~200 probes x 1000 cycles is under one golden run yet gives direct evidence,
+# where sampling full campaigns would only give indirect evidence at 12x the
+# cost. See fi_utils.probe_deposit for what landed/survived mean.
+# ---------------------------------------------------------------------------
+PROBE_FIELDS = [
+    "model", "module", "target_class", "target_path", "local_bit",
+    "global_bit", "phase", "probe_cycle", "pre", "mid", "post", "e", "c",
+    "landed", "survived",
+]
+
+_DEFAULT_PROBE_N = 200
+_DEFAULT_PROBE_STRIDE = 1000
+
+
+def _rate(num, den):
+    return f"{100.0 * num / den:5.1f}%({num}/{den})" if den else "    -    "
+
+
+def _probe_table(rows):
+    """Group probe rows by (module, target_class, phase) and render the
+    acceptance table. `survived` is split by `e` because a flip that vanishes
+    while the write enable was high is correct behaviour, not a bug."""
+    keys = []
+    for r in rows:
+        k = (r["module"], r["target_class"], r["phase"])
+        if k not in keys:
+            keys.append(k)
+    lines = [
+        "fi-probe: %-13s %-15s %-5s %6s  %-15s %-15s %-15s %-15s" % (
+            "module", "target_class", "phase", "n", "landed", "survived",
+            "survived|e=0", "survived|e=1"),
+    ]
+    for k in sorted(keys):
+        grp = [r for r in rows
+               if (r["module"], r["target_class"], r["phase"]) == k]
+        land = [r for r in grp if r["landed"] is not None]
+        surv = [r for r in grp if r["survived"] is not None]
+        e0 = [r for r in surv if r["e"] == 0]
+        e1 = [r for r in surv if r["e"] == 1]
+        lines.append(
+            "fi-probe: %-13s %-15s %-5s %6d  %-15s %-15s %-15s %-15s" % (
+                k[0], k[1], k[2], len(grp),
+                _rate(sum(1 for r in land if r["landed"]), len(land)),
+                _rate(sum(1 for r in surv if r["survived"]), len(surv)),
+                _rate(sum(1 for r in e0 if r["survived"]), len(e0)),
+                _rate(sum(1 for r in e1 if r["survived"]), len(e1))))
+    return lines
+
+
+async def run_probe(dut, fixture, elf_path, input_data, expected_output, *,
+                    model_name, n_probes=None, stride=None, seed=None,
+                    phases=("pose", "nege")):
+    """Probe the deposit mechanism across every module's target classes.
+
+    Env knobs: FI_PROBE_N (200), FI_PROBE_STRIDE (1000), FI_SEED, and
+    FI_PROBE_STRICT (if set, a landed rate below 100% fails the test instead
+    of only being reported -- for use as a standing guard once A-1.1 is
+    closed; the diagnostic run wants the table, not an exception)."""
+    n_probes = int(os.environ.get("FI_PROBE_N", n_probes or _DEFAULT_PROBE_N))
+    stride = int(os.environ.get("FI_PROBE_STRIDE",
+                                stride or _DEFAULT_PROBE_STRIDE))
+    seed = int(str(os.environ.get("FI_SEED", seed or _DEFAULT_SEED)), 0)
+    rng = random.Random(seed)
+
+    modules = list(fi_utils.MODULES)
+    cocotb.log.info("fi-probe: model=%s seed=%d n=%d stride=%d phases=%s",
+                    model_name, seed, n_probes, stride, phases)
+
+    # Same bring-up as an injected run, but we never wait for the halt: the
+    # probe only needs the design to be actively clocking real work.
+    await fixture.load_elf_and_lookup_symbols(
+        elf_path,
+        ["inference_status", "inference_status_message",
+         "inference_input", "inference_output"],
+    )
+    await fixture.write("inference_input", input_data)
+    await fixture.write("inference_output",
+                        np.zeros(expected_output.size, dtype=np.int8))
+    await fixture.core_mini_axi.execute_from(fixture.entry_point)
+
+    space = {}
+    for m in modules:
+        tg = fi_utils.collect_targets(dut, m)
+        space[m] = (tg, sum(t["width"] for t in tg))
+        cocotb.log.info("fi-probe: module '%s': %d targets, %d bits",
+                        m, len(tg), space[m][1])
+        # Composition of the fault space, indices collapsed. The campaign only
+        # ever reports the total, which hides both missing cells (A-1.3/A-1.4)
+        # and cells that appear or vanish when Verilator's inlining decisions
+        # change -- exposing a wrapper port is enough to move that line.
+        comp = {}
+        for t in tg:
+            pat = re.sub(r"\[\d+\]", "[]", t["path"])
+            n, b = comp.get(pat, (0, 0))
+            comp[pat] = (n + 1, b + t["width"])
+        for pat, (n, b) in sorted(comp.items(), key=lambda kv: -kv[1][1]):
+            cocotb.log.info("fi-probe:   %6d b  x%-4d  %s", b, n, pat)
+
+    await ClockCycles(dut.io_aclk, _INJECT_CYCLE_MIN)
+    cycle = _INJECT_CYCLE_MIN
+
+    rows = []
+    for i in range(n_probes):
+        await ClockCycles(dut.io_aclk, stride)
+        cycle += stride
+        if int(dut.io_halted.value) == 1 or int(dut.io_fault.value) == 1:
+            cocotb.log.info(
+                "fi-probe: run ended at cycle %d after %d probes; stopping "
+                "(probe perturbs the design, an early end is expected)",
+                cycle, i)
+            break
+        module = modules[i % len(modules)]
+        targets, bits = space[module]
+        if bits == 0:
+            continue
+        gbit = rng.randrange(bits)
+        target, lbit = _locate_global_bit(targets, gbit)
+        e_h, c_h = fi_utils.enable_handles(target)
+        # Phase advances once per full pass over the modules; stepping it per
+        # probe would alias against the module rotation and pin each module to
+        # a single phase (len(phases) divides len(modules)).
+        phase = phases[(i // len(modules)) % len(phases)]
+        r = await fi_utils.probe_deposit(
+            dut.io_aclk, target["handle"], lbit,
+            phase=phase, e_handle=e_h, c_handle=c_h)
+        cycle += 2
+        r.update({"model": model_name, "module": module,
+                  "target_class": fi_utils.target_class(target),
+                  "target_path": target["path"], "local_bit": lbit,
+                  "global_bit": gbit, "probe_cycle": cycle})
+        rows.append(r)
+
+    out_dir = _outputs_dir()
+    path = os.path.join(out_dir, "fi_probe.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PROBE_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r[k])
+                        for k in PROBE_FIELDS})
+    for line in _probe_table(rows):
+        cocotb.log.info("%s", line)
+    cocotb.log.info("fi-probe: %d probes -> %s", len(rows), path)
+
+    landed = [r for r in rows if r["landed"] is not None]
+    n_bad = sum(1 for r in landed if not r["landed"])
+    if n_bad:
+        msg = (f"fi-probe: {n_bad}/{len(landed)} deposits did NOT land -- the "
+               "injection mechanism is broken for those targets, campaign "
+               "results covering them are not interpretable")
+        if os.environ.get("FI_PROBE_STRICT"):
+            raise AssertionError(msg)
+        cocotb.log.error("%s", msg)
+    else:
+        cocotb.log.info("fi-probe: all %d measured deposits landed", len(landed))
+    return rows
 
 
 async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
@@ -268,9 +510,27 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
         cocotb.log.info("fi: dumping cocotb hierarchy (depth=4)")
         fi_utils.dump_hierarchy(dut, max_depth=4)
 
+    # ---- Targets, collected up front so the golden run can measure liveness -
+    collected = {m: fi_utils.collect_targets(dut, m) for m in modules}
+    live_masks = {m: [0] * len(collected[m]) for m in modules}
+    live_period = int(os.environ.get("FI_LIVENESS_PERIOD",
+                                     _DEFAULT_LIVENESS_PERIOD))
+
+    async def _watch_liveness(_dut, clock, holders):
+        """Piggy-backs on the inject_cb hook of the golden run: spawns one
+        read-only watcher per module and lets _run_once kill them at the end."""
+        if live_period <= 0:
+            return
+        for m in modules:
+            holders.append(cocotb.start_soon(
+                _liveness_watcher(clock, collected[m], live_period,
+                                  live_masks[m])))
+
     # ---- Golden run x2 (determinism gate for the threshold-free taxonomy) --
-    cocotb.log.info("fi: ===== golden run #1 (model=%s) =====", model_name)
-    g1 = await _run_once(dut, fixture, elf_path, input_data, expected_output)
+    cocotb.log.info("fi: ===== golden run #1 (model=%s, +liveness) =====",
+                    model_name)
+    g1 = await _run_once(dut, fixture, elf_path, input_data, expected_output,
+                         inject_cb=_watch_liveness)
     assert g1["halted"] and g1["status"] == 0 and g1["bitexact"], (
         f"golden#1 bad: halted={g1['halted']} status={g1['status']} "
         f"bitexact={g1['bitexact']} faulted={g1['faulted']} hung={g1['hung']}")
@@ -286,6 +546,21 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
     upper_cycle = max(_INJECT_CYCLE_MIN + 1, golden_halt)
     cocotb.log.info("fi: golden halt=%d, per-run timeout=%d",
                     golden_halt, hang_timeout)
+
+    # Attach the measured liveness to the targets and report the dead-silicon
+    # share per module. A 0% live figure means the watcher never ran (period
+    # disabled) -- conditional AVF is then simply absent, not zero.
+    live_bits = {}
+    for m in modules:
+        for t, mask in zip(collected[m], live_masks[m]):
+            t["live_mask"] = mask
+        live_bits[m] = sum(bin(mask).count("1") for mask in live_masks[m])
+        space_m = sum(t["width"] for t in collected[m])
+        cocotb.log.info(
+            "fi: module '%s' liveness: %d/%d bits toggled during golden "
+            "(%.1f%% live, %.1f%% dead for this workload)",
+            m, live_bits[m], space_m, _pct(live_bits[m], space_m),
+            _pct(space_m - live_bits[m], space_m))
 
     # ---- Open CSVs (incremental, per-row flush so partial data survives) ---
     out_dir = _outputs_dir()
@@ -304,7 +579,7 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
     run_id = 0
     # ---- 4 modules x 3 fault types --------------------------------------
     for module in modules:
-        targets = fi_utils.collect_targets(dut, module)
+        targets = collected[module]
         space = sum(t["width"] for t in targets)
         ft_scheme = fi_utils.MODULES[module]["ft_scheme"]
         if space == 0:
@@ -318,6 +593,9 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
 
         for fault_type in fault_types:
             counts = {b: 0 for b in fi_utils.OUTCOMES}
+            counts_live = {b: 0 for b in fi_utils.OUTCOMES}
+            counts_fired = {b: 0 for b in fi_utils.OUTCOMES}
+            n_not_fired = 0
             cocotb.log.info(
                 "fi: ===== group module=%s fault_type=%s : %d runs =====",
                 module, fault_type, n_runs)
@@ -326,8 +604,9 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                 gbit = rng.randrange(space)
                 inj_cycle = rng.randint(_INJECT_CYCLE_MIN, upper_cycle)
                 target, lbit = _locate_global_bit(targets, gbit)
-                cb = _make_inject_cb(target, lbit, inj_cycle,
-                                     fault_type, stuck_val)
+                cb, inj_state = _make_inject_cb(
+                    target, lbit, inj_cycle, fault_type, stuck_val,
+                    set_timeout=hang_timeout)
                 res = await _run_once(
                     dut, fixture, elf_path, input_data, expected_output,
                     inject_cb=cb, timeout_cycles=hang_timeout)
@@ -337,6 +616,14 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     output_bitexact=bool(res["bitexact"]),
                     argmax_match=bool(res["argmax_match"]))
                 counts[outcome] += 1
+                bit_live = bool((target.get("live_mask", 0) >> lbit) & 1)
+                if bit_live:
+                    counts_live[outcome] += 1
+                fired = bool(inj_state.get("fired", True))
+                if fired:
+                    counts_fired[outcome] += 1
+                else:
+                    n_not_fired += 1
                 res_w.writerow({
                     "model": model_name, "module": module,
                     "ft_scheme": ft_scheme, "fault_type": fault_type,
@@ -344,7 +631,9 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     "run_id": run_id, "tag": "inject",
                     "target_path": target["path"], "local_bit": lbit,
                     "global_bit": gbit, "fault_space_bits": space,
-                    "inject_cycle": inj_cycle, "halt_cycle": res["cycles"],
+                    "bit_live": bit_live,
+                    "inject_cycle": inj_cycle, "fault_fired": fired,
+                    "halt_cycle": res["cycles"],
                     "halted": res["halted"], "faulted": res["faulted"],
                     "hung": res["hung"],
                     "status": (res["status"]
@@ -357,10 +646,20 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                 })
                 res_f.flush()
             sum_w.writerow(_summary_row(
-                model_name, module, ft_scheme, fault_type, stuck_val, counts))
+                model_name, module, ft_scheme, fault_type, stuck_val, counts,
+                counts_live=counts_live, live_bits=live_bits.get(module, 0),
+                space=space, counts_fired=counts_fired,
+                n_not_fired=n_not_fired))
             sum_f.flush()
             cocotb.log.info("fi: group module=%s fault_type=%s -> %s",
                             module, fault_type, counts)
+            cocotb.log.info("fi:   conditional (live bits only, n=%d) -> %s",
+                            sum(counts_live.values()), counts_live)
+            if n_not_fired:
+                cocotb.log.info(
+                    "fi:   %d/%d runs never expressed the fault (cell not "
+                    "written again before end of run); excluded from *_fired",
+                    n_not_fired, n_runs)
 
     res_f.close()
     sum_f.close()

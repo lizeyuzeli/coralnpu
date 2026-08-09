@@ -22,10 +22,15 @@ pipeline stage). The four modules map one-to-one onto the planned fault-
 tolerance schemes:
 
     decode_path   front-end instruction queues  -> (TMR candidate)
-    compute_ctrl  ROB control state             -> TMR
+    compute_ctrl  ROB control state + trap ff   -> TMR
     execute       all execution-unit datapath/  -> DMR
                   control FFs + RS + result fifo
     storage       vector register file          -> ECC
+
+A cell earns its place in this partition by representing real circuit error
+or by proving an FT mechanism works -- not by being a flip-flop. That is why
+the ROB data plane (`rob_data`) and the fifo bookkeeping (`fifo_ptr`) are
+registry entries but NOT analysis modules: see their `description` fields.
 
 Injection targets are reached through three Verilator `public_flat_rw`
 exposures (see rules/default.vlt.tpl):
@@ -35,12 +40,21 @@ exposures (see rules/default.vlt.tpl):
 plus the ROB control regs (entry_valid/uop_done/trap_flag) and the VRF
 `vreg`, which carry their own dedicated vlt directives.
 
-  *Important isolation rule:* the multi_fifo read/write pointers (wptr/rptr/
-  entry_count) are themselves cdffr instances. They are fifo-internal
-  bookkeeping, NOT control- or data-path state, and are EXCLUDED from every
-  module. The collector enforces this by only taking `mem` (never `q`) from
-  inside a multi_fifo subtree, and by only walking compute-unit subtrees
-  (which contain no fifo) for `q`.
+  *Partition rule (INV-3):* the injection space is partitioned BY SUB-MODULE,
+  not assembled by enumerating registers that looked interesting. Every
+  sequential cell belongs to exactly one sub-module, and the sub-module is
+  also the AVF denominator -- because the decision this whole flow feeds is
+  "which sub-module gets which FT scheme", the denominator has to be the
+  decision unit. Corollary: bit counts are NOT comparable across sub-modules
+  (a control flop representing a runaway state machine and a buffer cell
+  representing only itself do not belong in one weighted ranking).
+
+  The multi_fifo read/write pointers (wptr/rptr/entry_count) are themselves
+  cdffr instances. They are fifo-internal bookkeeping, NOT control- or data-
+  path state, and are EXCLUDED from every analysis module; the collector
+  enforces this by only taking `mem` (never `q`) from inside a multi_fifo
+  subtree, and by only walking compute-unit subtrees (which contain no fifo)
+  for `q`. They are measured on their own as the `fifo_ptr` diagnostic item.
 
 Three fault models, matching the physical threats the FT schemes defend
 against:
@@ -50,7 +64,7 @@ against:
 """
 
 import cocotb
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import FallingEdge, RisingEdge
 
 
 # Hierarchical prefix from the cocotb `dut` (the `RvvCoreMiniHighmemAxi`
@@ -81,7 +95,9 @@ FAULT_TYPES = ("seu", "set", "stuck")
 # `mem`). Fifo pointers (wptr/rptr/entry_count) are cdffr `q` cells, but they
 # live only under multi_fifo subtrees that we reach via `walk="mem"` (which
 # matches `mem`, not `q`), so they are never collected -- keeping fifo
-# bookkeeping out of every module's fault space.
+# bookkeeping out of every analysis module's fault space (INV-3). The
+# `fifo_ptr` diagnostic entry at the end of the registry points `walk="q"` at
+# those same fifo subtrees to measure them on their own.
 # ---------------------------------------------------------------------------
 MODULES = {
     "decode_path": {
@@ -97,10 +113,56 @@ MODULES = {
     "compute_ctrl": {
         "ft_scheme": "tmr",
         "description": "Computation control unit: ROB per-entry control state "
-                       "(entry_valid / uop_done / trap_flag). Pointers excluded.",
+                       "(entry valid / uop_done / trap_flag) plus the trap "
+                       "handshake register. Pointers excluded.",
         "sources": [
-            {"root": ("u_rob",),
-             "names": ["entry_valid", "uop_done", "trap_flag"]},
+            {"root": ("u_rob",), "names": ["uop_done", "trap_flag"]},
+            # Entry-valid state. NOT `u_rob.entry_valid`: that name is the
+            # combinational `fifo_data` output of this fifo, so a deposit onto
+            # it is recomputed away before it can do anything -- measured at
+            # landed 0/4, survived 0/9 by the deposit probe. The state itself
+            # lives in the fifo buffer, which is what we inject.
+            {"root": ("u_rob", "u_uop_valid_fifo"), "walk": "mem"},
+            # The trap handshake flop (rvv_backend_rob.sv, `edff trap_ready`).
+            # One bit, and the single most consequential one in this module: it
+            # drives `trap_flush_rvv`, which flushes the whole backend. It has
+            # `.e(1'b1)`, so it is write-enabled every cycle -- a `set` upset
+            # always lands. It was missing from every module's fault space
+            # until Stage 3: the hand-written source list had drifted from the
+            # RTL's actual sequential-cell list, which is exactly the drift
+            # INV-3's "partition is exhaustive and disjoint" rule now forbids.
+            # We take the edff's `q`, not the `trap_ready_rvv2rvs` net it
+            # drives (INV-1: the net would be overwritten by the flop output).
+            {"root": ("u_rob", "trap_ready"), "names": ["q"]},
+        ],
+    },
+    # ---- diagnostic item, NOT part of the analysis matrix (see `analysis`) --
+    "rob_data": {
+        "ft_scheme": "none",
+        "analysis": False,
+        "description": "ROB data plane: the result memory and the uop info "
+                       "buffer. Kept separate from compute_ctrl because the FT "
+                       "split is by semantics, not by physical block: ROB "
+                       "control gets TMR, ROB data is deliberately left "
+                       "unprotected. Demoted out of the analysis matrix in "
+                       "Stage 3 for three independent reasons. (1) No FT scheme "
+                       "will ever be decided from its number: an execution "
+                       "error that reaches here is already caught upstream by "
+                       "DMR's write-back comparison, and ECC here would protect "
+                       "only this one register stage -- so the measurement "
+                       "answers no question. (2) Residency time: an SEU cross "
+                       "section scales as area x time-resident, and these are "
+                       "pipeline buffers holding a result for a handful of "
+                       "cycles, unlike the architecturally-visible VRF in "
+                       "`storage` which holds one for thousands. (3) It is the "
+                       "entry that made the Stage 2 bit-count-weighted ranking "
+                       "misleading: 2904 bits of short-lived buffer outranked "
+                       "24 bits of state-machine control, which inverts the "
+                       "real protection priority. Still measurable by name so "
+                       "the Stage 2 baseline stays reproducible.",
+        "sources": [
+            {"root": ("u_rob",), "names": ["res_mem"]},
+            {"root": ("u_rob", "u_uop_info_fifo"), "walk": "mem"},
         ],
     },
     "execute": {
@@ -119,12 +181,16 @@ MODULES = {
             {"root": ("u_mul_rs",), "walk": "mem"},
             {"root": ("u_div_rs",), "walk": "mem"},
             {"root": ("u_falu_rs",), "walk": "mem"},
-            # NOTE: the result fifo (u_res_ff in the gen_res_ff generate block)
-            # is intentionally NOT a target. Verilator inlines that genblock so
-            # it has no clean scope, and more importantly its contents are a
-            # one-cycle downstream copy of the execution-unit results already
-            # covered by the edff `q` cells above -- injecting it would be
-            # near-redundant with the execution outputs. See README scope note.
+            # Per-unit result fifos (gen_res_ff[i].u_res_ff, PU->arbiter).
+            # These were excluded in Stage 1 on a "one-cycle downstream copy of
+            # results already covered by the unit `q` cells, so near-redundant"
+            # argument. That was wrong on both counts: they are real sequential
+            # cells holding a result for an unbounded number of cycles while the
+            # arbiter backpressures (so not a copy of anything still live in the
+            # unit), and INV-2 sizes the fault space by silicon, not by whether
+            # a cell's content correlates with another's. Leaving them out
+            # silently shrank the execute fault space by ~18%.
+            {"root": ("gen_res_ff",), "walk": "mem"},
         ],
     },
     "storage": {
@@ -137,19 +203,60 @@ MODULES = {
             {"root": ("u_vrf",), "walk": "q"},
         ],
     },
+    # ---- diagnostic item, NOT part of the analysis matrix (see `analysis`) --
+    "fifo_ptr": {
+        "ft_scheme": "none",
+        "analysis": False,
+        "description": "Fifo bookkeeping: the write/read pointers and entry "
+                       "counters of every multi_fifo (cdffr `q` cells living "
+                       "under a fifo instance). INV-3 keeps these out of the "
+                       "five analysis modules -- a pointer is not decode, "
+                       "control, data, execute or storage state, and folding "
+                       "it into any of them would attribute its failures to "
+                       "the wrong block. But the silicon flips all the same, "
+                       "so it is measured as its own item: this number says "
+                       "what fifo bookkeeping is worth, and it is the one "
+                       "thing no per-module FT scheme in this project covers.",
+        "sources": [
+            {"root": ("u_command_queue",), "walk": "q"},
+            {"root": ("u_legal_command_queue",), "walk": "q"},
+            {"root": ("u_uop_queue",), "walk": "q"},
+            {"root": ("u_rob", "u_uop_valid_fifo"), "walk": "q"},
+            {"root": ("u_rob", "u_uop_info_fifo"), "walk": "q"},
+            {"root": ("u_alu_rs",), "walk": "q"},
+            {"root": ("u_pmtrdt_rs",), "walk": "q"},
+            {"root": ("u_mul_rs",), "walk": "q"},
+            {"root": ("u_div_rs",), "walk": "q"},
+            {"root": ("u_falu_rs",), "walk": "q"},
+            {"root": ("gen_res_ff",), "walk": "q"},
+        ],
+    },
 }
 
 MODULE_NAMES = tuple(MODULES.keys())
 
+# The four sub-modules the vulnerability matrix is defined over. Diagnostic
+# entries (rob_data, fifo_ptr) are addressable by name but never swept by
+# 'all', so adding one cannot silently change the matrix or the per-module
+# numbers.
+ANALYSIS_MODULE_NAMES = tuple(
+    k for k, m in MODULES.items() if m.get("analysis", True))
+
 
 def expand_module_spec(name):
-    """Resolve FI_MODULE to an ordered list of module keys ('all' = every)."""
+    """Resolve FI_MODULE to an ordered list of module keys.
+
+    'all' means the analysis matrix (ANALYSIS_MODULE_NAMES), not literally
+    every registry entry; 'every' includes the diagnostic ones too."""
     if name == "all":
+        return list(ANALYSIS_MODULE_NAMES)
+    if name == "every":
         return list(MODULE_NAMES)
     if name in MODULES:
         return [name]
     raise KeyError(
-        f"unknown FI_MODULE '{name}'. Known: {sorted(MODULE_NAMES)} or 'all'")
+        f"unknown FI_MODULE '{name}'. Known: {sorted(MODULE_NAMES)}, "
+        "'all' (analysis matrix) or 'every'")
 
 
 # ---------------------------------------------------------------------------
@@ -227,19 +334,26 @@ def _path_str(prefix, suffix):
     return ".".join(str(s) for s in (tuple(prefix) + tuple(suffix)))
 
 
-def _flatten_targets(handle, base_path, out):
+def _flatten_targets(handle, base_path, out, owner=None, kind=None):
     """Expand a (possibly multi-dimensional) handle into depositable leaves.
 
     A flat packed vector is taken as one target. An unpacked array (e.g. fifo
     `mem[DEPTH]` of packed entries) is recursed per index so a uniform bit pick
     spans every entry. Hierarchy scopes are not flattened here (the walker
-    handles those)."""
+    handles those).
+
+    `owner` is the instance scope the matched variable lives in (the edff /
+    cdffr / multi_fifo instance) and `kind` is how it was found. Neither
+    affects target selection; they let the deposit positive control read the
+    cell's write enable and report per exposure mechanism."""
     if _is_depositable(handle):
         out.append({"handle": handle, "width": len(handle),
-                    "path": _path_str(base_path, ())})
+                    "path": _path_str(base_path, ()),
+                    "owner": owner, "kind": kind})
         return
     for idx, child in _index_children(handle):
-        _flatten_targets(child, base_path + (f"[{idx}]",), out)
+        _flatten_targets(child, base_path + (f"[{idx}]",), out,
+                         owner=owner, kind=kind)
 
 
 def _walk_collect(node, want, base_path, out, max_depth=28, _depth=0):
@@ -252,7 +366,8 @@ def _walk_collect(node, want, base_path, out, max_depth=28, _depth=0):
         return
     for name, child in _attr_children(node):
         if name == want:
-            _flatten_targets(child, base_path + (name,), out)
+            _flatten_targets(child, base_path + (name,), out,
+                             owner=node, kind=want)
             continue
         _walk_collect(child, want, base_path + (name,), out,
                       max_depth=max_depth, _depth=_depth + 1)
@@ -290,7 +405,8 @@ def collect_targets(dut, module_name):
                 h = getattr(root, nm, None)
                 if h is not None and _is_depositable(h):
                     targets.append({"handle": h, "width": len(h),
-                                    "path": _path_str(base, (nm,))})
+                                    "path": _path_str(base, (nm,)),
+                                    "owner": root, "kind": "name"})
                 else:
                     cocotb.log.warning(
                         "fi: module '%s' signal %s.%s missing/not depositable",
@@ -318,8 +434,12 @@ def dump_hierarchy(node, max_depth=4, _depth=0, _prefix=""):
 
 
 # ---------------------------------------------------------------------------
-# Bit-flip primitives. All deposit on a rising edge so they land after the
-# design's NBA writes for that cycle.
+# Bit-flip primitives. `seu` and `stuck` deposit on a rising edge, so they land
+# after the design's NBA writes for that cycle. `set` is the exception: it must
+# align to the cell's write edge to model a combinational upset being latched,
+# so it both observes and deposits on the FALLING edge (a read at the rising
+# edge returns the pre-edge value, since the NBA has not settled yet). See
+# transient_bit_flip.
 # ---------------------------------------------------------------------------
 async def persistent_bit_flip(clock, signal, bit_index):
     """SEU: flip one bit once and leave it. The cell keeps the flipped value
@@ -332,18 +452,90 @@ async def persistent_bit_flip(clock, signal, bit_index):
     signal.value = int(signal.value) ^ (1 << bit_index)
 
 
-async def transient_bit_flip(clock, signal, bit_index, hold_cycles=1):
-    """SET: flip the bit, hold `hold_cycles`, flip back. Models a combinational
-    glitch whose net effect is a single mis-sampled value."""
-    await RisingEdge(clock)
+async def transient_bit_flip(clock, signal, bit_index, e_handle=None,
+                             timeout_cycles=None, state=None):
+    """SET: corrupt the value the cell captures at its next write.
+
+    A combinational upset does not live in a flip-flop -- it lives in the cone
+    feeding one, and its only lasting effect is that the flop latches a wrong
+    value at ITS sampling moment. So the injection has to be aligned to a
+    write, not to a random cycle. The previous model (flip at a random edge,
+    flip back one cycle later) landed on an idle cell 98.5% of the time (the
+    deposit probe measured a write-enable duty cycle under 1.5%), where it was
+    erased with no lasting effect -- it modelled a transient ON the flop, and a
+    mostly inert one, rather than a SET upstream of it.
+
+    A write is detected exactly via `e` when the cell exposes one (edff/cdffr),
+    and otherwise by observing the stored value change across the edge, which
+    covers multi_fifo buffers and bare registers uniformly. A write that stores
+    the same value is invisible to the fallback; it is also a write whose
+    captured value we could not corrupt observably, so nothing is lost.
+
+    Everything is observed and deposited at the FALLING edge, never at the
+    rising one. Reading at the rising edge returns the pre-edge value (the NBA
+    update has not settled yet), so a rising-edge comparison never sees a write
+    and a rising-edge deposit races the design's own write. Mid-cycle both are
+    unambiguous: `e` is settled for the coming edge, and the value read one
+    falling edge later is what the cell actually captured.
+
+    If the cell is never written before `timeout_cycles` elapse, NOTHING is
+    injected. That is reported through `state["fired"]` rather than silently
+    counted as a masked run: a fault that was never expressed is not evidence
+    of tolerance."""
     width = len(signal)
     if not 0 <= bit_index < width:
         raise IndexError(f"bit_index {bit_index} out of range [0,{width})")
     mask = 1 << bit_index
-    signal.value = int(signal.value) ^ mask
-    for _ in range(hold_cycles):
-        await RisingEdge(clock)
-    signal.value = int(signal.value) ^ mask
+    if state is not None:
+        state["fired"] = False
+
+    def _read():
+        try:
+            return int(signal.value)
+        except Exception:  # noqa: BLE001 - X during reset
+            return None
+
+    waited = 0
+    prev = None
+    while timeout_cycles is None or waited < timeout_cycles:
+        await FallingEdge(clock)  # mid-cycle: `e` is settled, value has settled
+        waited += 1
+        cur = _read()
+        enabled = None
+        if e_handle is not None:
+            try:
+                enabled = bool(int(e_handle.value))
+            except Exception:  # noqa: BLE001
+                enabled = None
+        if enabled is None:
+            # Fallback: a write shows up as the stored value changing between
+            # two consecutive mid-cycles.
+            written = prev is not None and cur is not None and cur != prev
+            prev = cur
+            if not written:
+                continue
+        elif enabled:
+            # `e` is high for the edge that is COMING, so wait one more
+            # mid-cycle: by then the capture has happened and we can corrupt
+            # exactly what it captured.
+            await FallingEdge(clock)
+            waited += 1
+            cur = _read()
+            prev = cur
+        else:
+            prev = cur
+            continue
+        # We are past the capture edge: what the cell holds now is what it
+        # latched, so flipping a bit of it IS the mis-sampled value.
+        if cur is None:
+            continue
+        try:
+            signal.value = cur ^ mask
+        except Exception:  # noqa: BLE001
+            return
+        if state is not None:
+            state["fired"] = True
+        return
 
 
 async def permanent_stuck_at(clock, signal, bit_index, value):
@@ -365,6 +557,127 @@ async def permanent_stuck_at(clock, signal, bit_index, value):
         new = (cur | mask) if value else (cur & ~mask)
         if new != cur:
             signal.value = new
+
+
+# ---------------------------------------------------------------------------
+# Deposit positive control. NOT a fault model -- this is a self-test of the
+# injection mechanism (see README "positive control"). It exists because a
+# silently-failing injector and a genuinely well-masked design produce the
+# exact same campaign CSV: all MASKED. The probe separates two questions that
+# have two different fixes:
+#
+#   landed    did the VPI deposit reach the cell at all?
+#             False -> vlt exposure / handle / width layer is broken.
+#   survived  is the flipped value still there one rising edge later?
+#             False with e=1 -> physically CORRECT, the design wrote the cell.
+#             False with e=0 -> something re-drives the cell every eval; the
+#                               injector cannot express a persistent upset.
+#
+# Hence `e`/`c` are sampled at the edge that decides survival, and both must
+# be reported next to the rate or the rate cannot be interpreted.
+# ---------------------------------------------------------------------------
+def read_int(handle):
+    """int(handle.value) or None (missing handle / X bits). Never raises."""
+    if handle is None:
+        return None
+    try:
+        return int(handle.value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def enable_handles(target):
+    """(e, c) handles of a target's owning cell, or (None, None).
+
+    edff has `e` only, cdffr has `e` and `c`, multi_fifo.mem and the bare ROB
+    registers have neither. Requires the read-side vlt exposure; a None here
+    means the directive did not take, which is itself worth reporting."""
+    owner = target.get("owner")
+    if owner is None:
+        return None, None
+    out = []
+    for nm in ("e", "c"):
+        try:
+            out.append(getattr(owner, nm, None))
+        except Exception:  # noqa: BLE001 - cocotb raises on unknown children
+            out.append(None)
+    return out[0], out[1]
+
+
+def target_class(target):
+    """Coarse exposure mechanism of a target -- the axis the positive control
+    reports on, because the suspicion is per-mechanism (Verilator inlines the
+    edff / cdffr / multi_fifo wrappers; the bare ROB registers it does not).
+
+    edff vs cdffr is told apart by the presence of a `c` port, not by name:
+    both expose their cell as `q`."""
+    kind = target.get("kind")
+    if kind == "mem":
+        return "multi_fifo.mem"
+    if kind == "name":
+        return "rob.reg"
+    _, c = enable_handles(target)
+    return "cdffr.q" if c is not None else "edff.q"
+
+
+async def probe_deposit(clock, signal, bit_index, *, phase="pose",
+                        e_handle=None, c_handle=None, restore=True):
+    """Deposit one bit flip, read it back twice, put it back. Returns a dict.
+
+    Reproduces the write performed by persistent_bit_flip / transient_bit_flip
+    bit-for-bit, including the injection phase, so that it is a valid control
+    for them. `phase` selects where in the cycle the deposit happens:
+
+      "pose"  right after RisingEdge   -- identical to the production primitives
+      "nege"  right after FallingEdge  -- candidate fix (mid-cycle strike)
+
+    Read-back uses clock edges only (no ReadOnly / delta assumptions): the
+    falling edge is a point where the deposit has certainly been applied and
+    no flip-flop update can have intervened. For "nege" that point is already
+    behind us, so `landed` is not measurable there and comes back None --
+    `pose` measures it, and both phases share the same write mechanism.
+
+    `e`/`c` are sampled at the falling edge preceding the rising edge that
+    decides survival, i.e. the values the cell will actually act on."""
+    mask = 1 << bit_index
+    width = len(signal)
+    if not 0 <= bit_index < width:
+        raise IndexError(f"bit_index {bit_index} out of range [0,{width})")
+
+    if phase == "pose":
+        await RisingEdge(clock)
+    elif phase == "nege":
+        await FallingEdge(clock)
+    else:
+        raise ValueError(f"phase must be 'pose' or 'nege', got {phase!r}")
+
+    pre = read_int(signal)
+    if pre is None:  # X this cycle (reset / uninitialised); nothing to measure
+        return {"phase": phase, "pre": None, "mid": None, "post": None,
+                "e": None, "c": None, "landed": None, "survived": None}
+    signal.value = pre ^ mask
+
+    mid = None
+    landed = None
+    if phase == "pose":
+        await FallingEdge(clock)
+        mid = read_int(signal)
+        landed = None if mid is None else bool((mid ^ pre) & mask)
+
+    e_val = read_int(e_handle)
+    c_val = read_int(c_handle)
+
+    await FallingEdge(clock)  # crosses exactly one rising edge
+    post = read_int(signal)
+    survived = None if post is None else bool((post ^ pre) & mask)
+
+    # Undo, so ~200 probes can share one simulation without the design
+    # drifting arbitrarily far from the golden trajectory.
+    if restore and survived:
+        signal.value = post ^ mask
+
+    return {"phase": phase, "pre": pre, "mid": mid, "post": post,
+            "e": e_val, "c": c_val, "landed": landed, "survived": survived}
 
 
 # ---------------------------------------------------------------------------

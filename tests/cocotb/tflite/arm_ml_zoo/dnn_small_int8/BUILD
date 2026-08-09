@@ -120,12 +120,24 @@ DNN_SMALL_INT8_FI_TESTCASES = [
     "fi_compute_ctrl_seu",
     "fi_compute_ctrl_set",
     "fi_compute_ctrl_stuck",
+    # Diagnostic item since Stage 3, not part of the 4-sub-module matrix: the
+    # ROB data plane answers no FT-scheme question (DMR already covers what
+    # reaches it) and its bit count distorted the cross-module ranking. Kept
+    # runnable by name so the Stage 2 baseline stays reproducible.
+    "fi_rob_data_seu",
+    "fi_rob_data_set",
+    "fi_rob_data_stuck",
     "fi_execute_seu",
     "fi_execute_set",
     "fi_execute_stuck",
     "fi_storage_seu",
     "fi_storage_set",
     "fi_storage_stuck",
+    # Diagnostic item, not part of the 4-sub-module matrix (see fi_utils INV-3).
+    "fi_fifo_ptr_seu",
+    "fi_fifo_ptr_set",
+    "fi_fifo_ptr_stuck",
+    "fi_deposit_probe",
     "fi_run_all",
 ]
 
@@ -163,5 +175,8 @@ cocotb_test_suite(
     vcs_defines = VCS_DEFINES,
     vcs_test_args = VCS_TEST_ARGS,
     vcs_verilog_sources = ["//hdl/chisel/src/coralnpu:rvv_core_mini_highmem_axi_cc_library_verilog"],
-    verilator_model = "//tests/cocotb:rvv_core_mini_highmem_axi_model",
+    # FI-specific model: -DSTOP_COND=0 so a scalar-core assertion tripped by an
+    # injected fault reports instead of aborting the group (see
+    # //tests/cocotb/fault_injection:BUILD).
+    verilator_model = "//tests/cocotb/fault_injection:rvv_core_mini_highmem_axi_fi_model",
 )

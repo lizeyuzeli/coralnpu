@@ -79,6 +79,18 @@ for _module in fi_utils.MODULE_NAMES:
 
 
 @cocotb.test()
+async def fi_deposit_probe(dut):
+    """Positive control for the deposit mechanism itself (not a fault model).
+
+    Independent of the 12 campaign targets: it never writes the vulnerability
+    CSVs and they never run it. See fi_campaign.run_probe."""
+    fixture, elf_path, input_data, expected_output = await _load_inputs(dut)
+    await fi_campaign.run_probe(
+        dut, fixture, elf_path, input_data, expected_output,
+        model_name="dnn_small_int8")
+
+
+@cocotb.test()
 async def fi_run_all(dut):
     """Whole-matrix run driven by FI_* env vars (single-target convenience)."""
     fixture, elf_path, input_data, expected_output = await _load_inputs(dut)
