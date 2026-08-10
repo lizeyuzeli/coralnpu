@@ -97,6 +97,45 @@ alongside any post-hardening AVF number.
 
 ---
 
+## 1b. Injection timing: why every primitive strikes at the falling edge
+
+VPI has no single-bit deposit. Injecting one bit means reading the whole
+handle, changing one bit, and writing all of it back — so the value read has
+to be the one the design has settled on. **A read at the rising edge returns
+the PRE-edge value** (the NBA update for that cycle has not been applied yet),
+so the write-back reimposes the previous cycle's value on every *other* bit of
+the register.
+
+On a packed multi-bit register that is a whole-register rollback, not a
+single-cell fault. Measured on an FT_ON build against the 24-bit
+`uop_done_tmr` (`fi_tmr_diag`, since deleted):
+
+| | |
+|---|---|
+| rising-edge read stale, on cycles where the register updated | **75152 / 75152 (100%)** |
+| register update rate, untouched | 25.34% |
+| register update rate, while replaying the read-modify-write with an **empty** mask (flipping *nothing*) | **0.00%** |
+
+A no-op write froze the register outright. Under the old rising-edge `stuck`
+this froze all three TMR copies at once — which no voter can correct — and
+produced a 12/12 DUE-hang that measured the injector, not the design.
+
+All three primitives therefore observe and deposit on the **falling edge**.
+`transient_bit_flip` always did (it has to, to align to a write edge); the same
+reasoning applies to the other two. `probe_deposit`'s `pose` phase is kept only
+as a diagnostic and must not be used as a campaign's control.
+
+A second form of the same hazard: two strikes on bits of the *same* handle,
+issued as two tasks, read-modify-write at the same edge and clobber each other,
+so only one lands. The TMR reverse control needs exactly that (all three copies
+of `uop_done_tmr` share one handle), so it uses the grouped
+`persistent_multi_flip` / `permanent_multi_stuck_at`, which merge per handle
+into one masked write. With two racing tasks the control silently degraded to a
+single-copy strike — correctly masked by the voter, i.e. a broken control that
+looks like a working scheme (measured 2/8 breaking; grouped, 8/8).
+
+---
+
 ## 2. The three fault models
 
 Selected with `FI_FAULT_TYPE`. Each models a distinct physical threat the FT
@@ -180,6 +219,7 @@ asserts the two outputs are bit-identical before trusting any outcome.
 | `FI_DUMP_HIERARCHY` | unset | If set, dump the cocotb-visible hierarchy (depth 4) before running. Use when bringing up registry paths. |
 | `FI_PROBE_N` / `FI_PROBE_STRIDE` | `200` / `1000` | Deposit-probe sample count and the cycles between samples (see §6). |
 | `FI_PROBE_STRICT` | unset | If set, a failed deposit fails the probe test instead of only logging an error. |
+| `FI_TMR_DEFEAT` | unset | Reverse control for an FT_ON build: strike **two** TMR copies of one logical bit per run, breaking the majority. Asserts the runs DO break the design. Not a fault model — see §7. |
 
 The experiment matrix is `4 sub-modules × 3 fault types = 12 groups`; each
 group is `FI_N` single-fault runs. The two diagnostics (`rob_data`,
@@ -196,6 +236,7 @@ group is `FI_N` single-fault runs. The two diagnostics (`rob_data`,
 | `model` | Model identifier passed to `run_campaign(model_name=...)`. |
 | `module` / `ft_scheme` | The module under test and its target FT scheme. |
 | `fault_type` / `stuck_val` | `seu`/`set`/`stuck`; polarity if stuck. |
+| `ft_build` | `FT_OFF` / `FT_ON` — which RTL build produced the row, probed from the hierarchy (§7). An FT_ON and an FT_OFF campaign write identically-shaped files; this column is what keeps them apart once archived. |
 | `run_id` | Monotonic across the whole matrix. |
 | `target_path` | Hierarchical path of the exact signal hit (the injection site). |
 | `local_bit` / `global_bit` / `fault_space_bits` | Bit within the signal, bit within the module's flat space, and the total module space. |
@@ -296,7 +337,119 @@ Two honesty caveats that must accompany any conclusion:
 
 ---
 
-## 8. Layout
+## 8. FT_ON vs FT_OFF comparison, and its reverse control
+
+The campaign runs against either RTL build. `FAULT_TOLERANT_ON` is a `` `define ``
+in `hdl/verilog/rvv/inc/rvv_backend_define.svh`; the framework **probes** which
+build it is looking at (`fi_utils.ft_build_is_on`, keyed on `u_rob.uop_done_tmr`
+existing) rather than taking an env var, so there is no second source of truth
+that could disagree with the model actually being simulated. The result is
+recorded as the `ft_build` column of both CSVs.
+
+**What changes on FT_ON.** Only `compute_ctrl` and the `fifo_ptr` diagnostic.
+Triplicating the ROB's 25 control bits renames every one of their cells, so
+those modules carry a `sources_ft` registry variant:
+
+| FT_OFF | FT_ON |
+|---|---|
+| `u_rob.uop_done` | `u_rob.uop_done_tmr` (packed, `copy*8 + entry`) |
+| `u_rob.trap_flag` | `u_rob.trap_flag_tmr` (likewise) |
+| `u_rob.u_uop_valid_fifo.mem` | `u_rob.gen_uop_valid_fifo_tmr[c].u_uop_valid_fifo.mem` |
+| `u_rob.trap_ready.q` | `u_rob.gen_trap_ready_tmr[c].trap_ready.q` |
+
+The **voted nets keep the original names**, so `uop_done` and friends still
+resolve on an FT_ON build — as pure combinational voter outputs. Injecting them
+would be recomputed away (INV-1) and would measure the voter instead of the
+storage. The registry takes the three copies, never the voted name.
+
+**The fault space is the full 75 bit, not 25.** TMR spends 3× the silicon and
+every one of those cells is equally likely to be struck; sampling one copy
+would quietly assume the redundancy is free. Because the FT_OFF space is 25
+and the FT_ON space is 75, the two campaigns are **distribution comparisons at
+equal `FI_N`, not per-bit pairings** — the same seed picks different bits.
+
+**`space_bits` is a hard assertion.** `collect_targets` fails the test if the
+resolved fault space is not the expected size for the build. This is not
+defensive programming, it is the central hazard of the whole comparison: a
+registry path that stops resolving injects nothing, and "nothing was injected"
+and "every fault was corrected" produce the same all-MASKED table.
+
+### Result: `compute_ctrl`, dnn_small_int8, FI_N=30, seed 0xC0DE
+
+Both sides measured with the falling-edge primitives of §1b. Raw shares are
+over the whole fault space (25 b FT_OFF, 75 b FT_ON); conditional shares are
+over the bits this workload actually exercises (64.0% live on both).
+
+| fault | build | MASKED | SDC-crit | DUE-hang | cond. MASKED | cond. SDC | cond. DUE |
+|---|---|---|---|---|---|---|---|
+| seu   | FT_OFF | 50.0% | 3.33% | 46.67% | 66.67% | 5.56% | 27.78% |
+| seu   | **FT_ON** | **100%** | 0 | 0 | **100%** | **0** | **0** |
+| set   | FT_OFF | 70.0% | 0 | 30.0% | 50.0% | 0 | 50.0% |
+| set   | **FT_ON** | **100%** | 0 | 0 | **100%** | **0** | **0** |
+| stuck | FT_OFF | 43.33% | 0 | 56.67% | 5.56% | 0 | 94.44% |
+| stuck | **FT_ON** | **100%** | 0 | 0 | **100%** | **0** | **0** |
+
+Every non-MASKED outcome is gone, on all three fault models. The conditional
+`stuck` row is the sharpest: on the FT_OFF build 94.44% of faults on live bits
+took the design down, and on the FT_ON build none did.
+
+This is the expected result rather than a surprising one — register-only TMR
+corrects any single-copy upset by construction, so the interesting question was
+never "does the number drop" but "is the injector still bound to real storage
+when it does". That is what §1b's repair and the reverse control establish;
+without them this table would be indistinguishable from a broken registry.
+
+**Scope, per INV-6.** The framework injects flip-flops only, so this says
+FF-level faults in the ROB's 25 protected control bits are corrected. The D-side
+logic cone is shared by all three copies by design, so a combinational SET there
+hits all three identically and is not covered — and no mechanism here could
+observe it. **"AVF went to zero" ≠ "the ROB is fully hardened."** The FT
+machinery's own registers (`got_first`, `retry_cnt`, `ft_reinject_pend`,
+`replay_mem`) are also not in any injection module, so the protection's own
+vulnerability is unpriced.
+
+### The reverse control (`FI_TMR_DEFEAT=1`)
+
+The positive control of §6 proves a deposit reaches *a* cell. It cannot prove
+it reached the *right* cell. If the FT_ON registry were mis-bound to the voted
+net, the probe would report `landed=100%, survived=0%` — which is also the
+exact signature of a correct deposit onto a real flop that the design then
+rewrote (and the TMR scrub does rewrite these every cycle). Both stories end
+in 100% MASKED.
+
+What separates them is attacking the *mechanism* instead of the cell: strike
+the same logical bit in **two** copies, so two-of-three is wrong and the voter
+must yield a corrupted value. A correctly-bound injector then has to break the
+design; a mis-bound one still cannot. The campaign asserts exactly that —
+all-MASKED is the *failure* condition in this mode — and it checks up front
+that every logical bit resolved to a complete set of `FT_TMR_COPIES` cells, so
+an annotation drift cannot silently degrade the strike to a single copy and
+"prove" the opposite.
+
+Prefer `stuck` (`FI_STUCK_VAL=1`) for this control. A `seu` double-strike is
+one-shot and races the scrub, so it mostly ends MASKED (measured 1/10 on
+`compute_ctrl`); `stuck` re-forces the bits every cycle, overpowering the
+scrub, and hit 10/10 across all three cell classes. Both are valid; only the
+`stuck` variant gives per-class evidence in ten runs.
+
+These runs never enter the matrix: defeating a scheme designed for single
+faults says nothing about vulnerability. They write `fi_*_tmrdefeat.csv` and
+tag their rows `tmr_defeat`.
+
+### INV-6: what an FT_ON result does and does not mean
+
+The framework injects **flip-flops only**. Register-only TMR corrects any
+single-copy upset, `seu` and `set` alike, so a hardened module's AVF is driven
+to zero **by construction**. That conclusion is therefore scoped strictly to
+**FF-level faults**. The D-side logic cone is deliberately shared by all three
+copies (that is what "register-only" means), so a combinational SET in that
+cone hits all three identically and is *not* covered — and this framework has
+no mechanism that could expose it. **"AVF went to zero" ≠ "the ROB is fully
+hardened."** Any citation of an FT_ON number must carry this caveat.
+
+---
+
+## 9. Layout
 
 ```
 tests/cocotb/fault_injection/        <- this package (framework only)
@@ -349,7 +502,7 @@ See `tests/cocotb/tflite/arm_ml_zoo/dnn_small_int8/` for a working example.
 
 ---
 
-## 9. Quick start
+## 10. Quick start
 
 One bazel target per group, so the matrix parallelizes across cores. All are
 `tags=["manual"]`.
@@ -376,9 +529,18 @@ bazel test ${P}_fi_run_all --test_env=FI_DUMP_HIERARCHY=1 --test_env=FI_N=0
 
 # Locate outputs after a run.
 find bazel-testlogs -name 'fi_results*.csv' -o -name 'fi_summary*.csv' -o -name 'fi_probe.csv'
+
+# --- FT_ON build (uncomment `FAULT_TOLERANT_ON` in rvv_backend_define.svh) ---
+# Check the registry rebound before spending an hour: FI_N=0 prints the space,
+# and space_bits asserts it (compute_ctrl must read 75, not 25).
+bazel test ${P}_fi_run_all --test_env=FI_MODULE=compute_ctrl --test_env=FI_N=0
+
+# Reverse control -- MUST break the design. Run this before any FT_ON matrix.
+bazel test ${P}_fi_compute_ctrl_stuck --test_env=FI_N=10 \
+    --test_env=FI_TMR_DEFEAT=1 --test_env=FI_STUCK_VAL=1
 ```
 
-## 10. Scope / non-goals (current phase)
+## 11. Scope / non-goals (current phase)
 
 - **Single model.** Wired to `dnn_small_int8` to bound runtime. RVV bare-op
   workloads need a different (exact-vector) classifier with no benign/critical
@@ -394,4 +556,11 @@ find bazel-testlogs -name 'fi_results*.csv' -o -name 'fi_summary*.csv' -o -name 
   The `stuck` groups' non-zero SDC is the current stand-in evidence.
 - **No scalar-core / LSU / AXI targets.** Everything is inside the RVV
   backend; a fault in the scalar core or the memory path is out of scope.
+- **FT's own state is not a target.** On an FT_ON build the DMR machinery adds
+  registers of its own (`got_first`, `retry_cnt`, `ft_reinject_pend`,
+  `replay_mem`). None belongs to any injection module, so the FT_ON matrix
+  measures the *protected* state only and does not price the protection's own
+  vulnerability. They become targets when they are themselves hardened.
+- **FF only, so combinational SETs are unmeasurable** — INV-6, see §8. This is
+  the caveat that must travel with every FT_ON number.
 

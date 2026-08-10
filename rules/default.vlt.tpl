@@ -23,6 +23,18 @@ public -module "{HDL_TOPLEVEL}" -var "rst_ni"
 // storage module injects those edff `q` flip-flops instead.
 public_flat_rw -module "rvv_backend_rob"     -var "uop_done"
 public_flat_rw -module "rvv_backend_rob"     -var "trap_flag"
+// FAULT_TOLERANT_ON only: the TMR copies of those same two registers (Stage 3
+// of the DMR plan triplicates the ROB's 25 control bits). On an FT_ON build
+// `uop_done` / `trap_flag` above still exist but are the majority voter's
+// combinational OUTPUT, so depositing on them is recomputed away -- the
+// storage is these `*_tmr` vectors, and the campaign registry switches to
+// them automatically (fi_utils `sources_ft`). Absent on an FT_OFF build,
+// where Verilator ignores the directive with at most a warning.
+// The other two of the four are reached without a directive of their own:
+// entry_valid lives in the triplicated u_uop_valid_fifo (multi_fifo `mem`,
+// covered below) and trap_ready in three edff copies (`q`, covered below).
+public_flat_rw -module "rvv_backend_rob"     -var "uop_done_tmr"
+public_flat_rw -module "rvv_backend_rob"     -var "trap_flag_tmr"
 // `entry_valid` is deliberately NOT exposed, for the same reason as `vreg`:
 // it is the combinational `fifo_data` output of u_uop_valid_fifo, so a deposit
 // onto it is recomputed away before it can propagate (measured at landed 0/4

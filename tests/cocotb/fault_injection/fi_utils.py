@@ -99,6 +99,87 @@ FAULT_TYPES = ("seu", "set", "stuck")
 # `fifo_ptr` diagnostic entry at the end of the registry points `walk="q"` at
 # those same fifo subtrees to measure them on their own.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# FT_ON build variant (FAULT_TOLERANT_ON + the Stage-3 ROB control TMR).
+#
+# Triplicating the ROB's 25 control bits changes their hierarchical names, so
+# a registry written against the FT_OFF hierarchy would resolve to NOTHING on
+# an FT_ON build -- and an empty fault space produces exactly the result the
+# experiment hopes for ("the hardened module shows no vulnerability"). That
+# failure mode is the whole reason `space_bits` below is a hard assertion and
+# not a warning: a silently unbound path and a working TMR are indistinguishable
+# from the outcome table alone.
+#
+# What changes, per rvv_backend_rob.sv:
+#   uop_done   -> uop_done_tmr   [FT_TMR_COPIES][ROB_DEPTH], one packed vector
+#   trap_flag  -> trap_flag_tmr  likewise
+#   entry_valid-> gen_uop_valid_fifo_tmr[c].u_uop_valid_fifo.mem (3 fifo copies)
+#   trap_ready -> gen_trap_ready_tmr[c].trap_ready.q (3 edff copies)
+#
+# The voted nets keep the ORIGINAL names (uop_done / trap_flag / entry_valid /
+# trap_ready_rvv2rvs) so the RTL's readers did not change -- which means those
+# names still resolve on an FT_ON build while being pure combinational voter
+# outputs. Injecting them would violate INV-1 (a deposit is recomputed away),
+# and would also silently measure the voter instead of the storage. We take the
+# three copies, never the voted name.
+FT_TMR_COPIES = 3
+
+# Fault space accounting, FT_OFF vs FT_ON. 25 protected bits become 75 real
+# flip-flops, and 75 is the honest denominator: TMR spends 3x the silicon, and
+# every one of those cells is equally likely to be struck. Sampling only one
+# copy would quietly assume the redundancy is free.
+_COMPUTE_CTRL_BITS_OFF = 25
+_COMPUTE_CTRL_BITS_ON = _COMPUTE_CTRL_BITS_OFF * FT_TMR_COPIES
+
+
+def _ft_valid_fifo_root(copy):
+    return ("u_rob", "gen_uop_valid_fifo_tmr", copy, "u_uop_valid_fifo")
+
+
+def _ft_trap_ready_root(copy):
+    return ("u_rob", "gen_trap_ready_tmr", copy, "trap_ready")
+
+
+# FT_ON source list for compute_ctrl. The two packed *_tmr vectors carry all
+# three copies in one handle (bit = copy*ROB_DEPTH + entry); the fifo and edff
+# copies live in separate generate scopes and are listed per copy.
+#
+# `tmr` annotations are what lets the reverse control (see tmr_logical_map)
+# find the other two copies of a given logical bit. "packed" means one handle
+# holds every copy, `copy*stride + logical_bit`; "copy" means this whole source
+# is one copy, and a target's offset within the source IS the logical bit.
+_COMPUTE_CTRL_SOURCES_FT = (
+    [{"root": ("u_rob",), "names": ["uop_done_tmr", "trap_flag_tmr"],
+      "tmr": {"packed": True, "stride": 8}}]
+    + [{"root": _ft_valid_fifo_root(c), "walk": "mem",
+        "tmr": {"group": "entry_valid", "copy": c}}
+       for c in range(FT_TMR_COPIES)]
+    + [{"root": _ft_trap_ready_root(c), "names": ["q"],
+        "tmr": {"group": "trap_ready", "copy": c}}
+       for c in range(FT_TMR_COPIES)]
+)
+
+# Same story for the fifo-pointer diagnostic: u_uop_valid_fifo moved into a
+# generate scope and got triplicated, so its pointers did too. No bit-count
+# assertion here -- this item is diagnostic, its FT_ON size is a measurement
+# rather than a known constant -- but the path must still resolve, or the item
+# would silently shrink instead of reporting the larger pointer space.
+_FIFO_PTR_SOURCES_FT_ROB = [{"root": _ft_valid_fifo_root(c), "walk": "q"}
+                            for c in range(FT_TMR_COPIES)]
+
+
+def ft_build_is_on(dut):
+    """True if this build has FAULT_TOLERANT_ON (probed from the hierarchy).
+
+    Probed, not configured by an env var, because the RTL switch is a commented
+    `define in rvv_backend_define.svh: an env var would be a second source of
+    truth that can disagree with the model actually being simulated, and the
+    disagreement would show up as a wrong fault space rather than as an error.
+    `uop_done_tmr` exists only inside `ifdef FAULT_TOLERANT_ON`."""
+    return descend(dut, RVV_BACKEND_PREFIX + ("u_rob", "uop_done_tmr")) is not None
+
+
 MODULES = {
     "decode_path": {
         "ft_scheme": "tmr",
@@ -135,6 +216,12 @@ MODULES = {
             # drives (INV-1: the net would be overwritten by the flop output).
             {"root": ("u_rob", "trap_ready"), "names": ["q"]},
         ],
+        # FT_ON: the same 25 bits of state, now stored three times. See the
+        # FT_TMR block above for the name mapping and for why the fault space
+        # is the full 75 rather than one copy.
+        "sources_ft": _COMPUTE_CTRL_SOURCES_FT,
+        "space_bits": {False: _COMPUTE_CTRL_BITS_OFF,
+                       True: _COMPUTE_CTRL_BITS_ON},
     },
     # ---- diagnostic item, NOT part of the analysis matrix (see `analysis`) --
     "rob_data": {
@@ -222,6 +309,21 @@ MODULES = {
             {"root": ("u_legal_command_queue",), "walk": "q"},
             {"root": ("u_uop_queue",), "walk": "q"},
             {"root": ("u_rob", "u_uop_valid_fifo"), "walk": "q"},
+            {"root": ("u_rob", "u_uop_info_fifo"), "walk": "q"},
+            {"root": ("u_alu_rs",), "walk": "q"},
+            {"root": ("u_pmtrdt_rs",), "walk": "q"},
+            {"root": ("u_mul_rs",), "walk": "q"},
+            {"root": ("u_div_rs",), "walk": "q"},
+            {"root": ("u_falu_rs",), "walk": "q"},
+            {"root": ("gen_res_ff",), "walk": "q"},
+        ],
+        # FT_ON: u_uop_valid_fifo is triplicated inside a generate scope, so
+        # its pointer set is too (+2 copies). Every other fifo is untouched.
+        "sources_ft": [
+            {"root": ("u_command_queue",), "walk": "q"},
+            {"root": ("u_legal_command_queue",), "walk": "q"},
+            {"root": ("u_uop_queue",), "walk": "q"},
+        ] + _FIFO_PTR_SOURCES_FT_ROB + [
             {"root": ("u_rob", "u_uop_info_fifo"), "walk": "q"},
             {"root": ("u_alu_rs",), "walk": "q"},
             {"root": ("u_pmtrdt_rs",), "walk": "q"},
@@ -378,15 +480,27 @@ def _walk_collect(node, want, base_path, out, max_depth=28, _depth=0):
                       max_depth=max_depth, _depth=_depth + 1)
 
 
-def collect_targets(dut, module_name):
+def collect_targets(dut, module_name, ft_on=None):
     """Build the flat list of depositable targets for one module.
 
     Returns a list of dicts {handle, width, path}. The campaign treats the
     concatenation of all widths as the module's fault space and picks a global
-    bit uniformly across it."""
+    bit uniformly across it.
+
+    On an FT_ON build a module with a `sources_ft` entry uses that list
+    instead, because triplication renamed its cells. If the module also
+    declares `space_bits`, the resulting fault space is asserted against the
+    expected count for this build -- a hard failure, deliberately. The
+    signature of a registry path that no longer resolves is an empty or short
+    fault space, which for a hardened module yields a flawless-looking result
+    table; nothing downstream can tell that apart from the TMR working."""
     spec = MODULES[module_name]
+    if ft_on is None:
+        ft_on = ft_build_is_on(dut)
+    sources = spec["sources_ft"] if (ft_on and "sources_ft" in spec) \
+        else spec["sources"]
     targets = []
-    for src in spec["sources"]:
+    for src in sources:
         base = RVV_BACKEND_PREFIX + src["root"]
         root = descend(dut, base)
         if root is None:
@@ -400,6 +514,7 @@ def collect_targets(dut, module_name):
                 "Parent children: %s",
                 module_name, ".".join(str(s) for s in base), avail)
             continue
+        first = len(targets)
         if "names" in src:
             for nm in src["names"]:
                 h = getattr(root, nm, None)
@@ -413,7 +528,81 @@ def collect_targets(dut, module_name):
                         module_name, ".".join(str(s) for s in base), nm)
         else:  # "walk": "q" | "mem"
             _walk_collect(root, src["walk"], base, targets)
+        # Carry the source's TMR annotation onto the targets it produced, plus
+        # each target's bit offset within the source, which is what identifies
+        # the logical bit across copies.
+        if "tmr" in src:
+            off = 0
+            for t in targets[first:]:
+                t["tmr"] = dict(src["tmr"], src_offset=off)
+                off += t["width"]
+
+    expect = spec.get("space_bits", {}).get(bool(ft_on))
+    if expect is not None:
+        got = sum(t["width"] for t in targets)
+        assert got == expect, (
+            f"fi: module '{module_name}' fault space is {got} bit, expected "
+            f"{expect} for a FAULT_TOLERANT_ON={bool(ft_on)} build. A registry "
+            "path stopped resolving (renamed cell / new generate scope / "
+            "missing vlt exposure). This is fatal by design: an unbound path "
+            "injects nothing, and 'nothing was injected' is indistinguishable "
+            "from 'every fault was corrected' in the outcome table.")
     return targets
+
+
+# ---------------------------------------------------------------------------
+# Reverse control for a TMR-hardened module (FI_TMR_DEFEAT).
+#
+# The positive control (probe_deposit) proves a deposit reaches a cell. It
+# CANNOT prove the cell it reached is the right one. Suppose the FT_ON registry
+# were mis-bound to the voted net `uop_done` instead of `uop_done_tmr`: the
+# probe would report landed=100%, survived=0% -- which is exactly the signature
+# of a correct deposit onto a real flop that the design then rewrote (and the
+# scrub does rewrite these every cycle). Both stories end in a campaign of 100%
+# MASKED, and no amount of positive control separates them.
+#
+# What does separate them is attacking the mechanism instead of the cell: flip
+# the SAME logical bit in TWO copies at once. Two-of-three is now wrong, so a
+# correctly-bound injector MUST produce non-MASKED outcomes; a mis-bound one
+# still produces none. This mirrors the RTL-side self-test, where widening the
+# sweep from one copy to two turned the regression from PASS to FAIL and thereby
+# proved the single-copy PASS meant something.
+#
+# It is a control, not a fault model: defeating a scheme designed for single
+# faults says nothing about vulnerability, so these runs never enter the
+# matrix or the baseline CSVs.
+# ---------------------------------------------------------------------------
+def tmr_logical_map(targets):
+    """Group a module's targets into logical bits -> [(target, local_bit)].
+
+    Returns a list of groups, each holding the FT_TMR_COPIES physical cells
+    that store one logical bit. Groups that do not come out at full width are
+    dropped (and reported by the caller): a partial group means the annotation
+    no longer matches the RTL, and injecting a partial group would defeat
+    nothing while looking like it did."""
+    groups = {}
+    for t in targets:
+        ann = t.get("tmr")
+        if ann is None:
+            continue
+        for local in range(t["width"]):
+            if ann.get("packed"):
+                # One handle holds all copies of one register: within THIS
+                # target (not the source -- uop_done_tmr and trap_flag_tmr are
+                # two such targets), bit = copy*stride + logical.
+                copy, logical = divmod(local, ann["stride"])
+                key = (t["path"], logical)
+            else:
+                # One source per copy: position within the source is the
+                # logical bit, and the source knows which copy it is.
+                copy = ann["copy"]
+                key = (ann["group"], ann["src_offset"] + local)
+            groups.setdefault(key, {})[copy] = (t, local)
+    out = []
+    for key, by_copy in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        if len(by_copy) == FT_TMR_COPIES:
+            out.append([by_copy[c] for c in sorted(by_copy)])
+    return out
 
 
 def dump_hierarchy(node, max_depth=4, _depth=0, _prefix=""):
@@ -434,22 +623,92 @@ def dump_hierarchy(node, max_depth=4, _depth=0, _prefix=""):
 
 
 # ---------------------------------------------------------------------------
-# Bit-flip primitives. `seu` and `stuck` deposit on a rising edge, so they land
-# after the design's NBA writes for that cycle. `set` is the exception: it must
-# align to the cell's write edge to model a combinational upset being latched,
-# so it both observes and deposits on the FALLING edge (a read at the rising
-# edge returns the pre-edge value, since the NBA has not settled yet). See
-# transient_bit_flip.
+# Bit-flip primitives. ALL THREE observe and deposit on the FALLING edge.
+#
+# This is not a style choice, it is the only correct point. Every primitive
+# here performs a read-modify-write of the WHOLE handle -- VPI has no
+# single-bit deposit, so injecting one bit means writing back all the others
+# unchanged. That is harmless only if the value read is the one the design
+# has settled on. A read at the RISING edge returns the PRE-edge value,
+# because the NBA update for that cycle has not been applied yet, so the
+# write-back reimposes the previous cycle's value on every other bit of the
+# handle -- undoing the design's own update.
+#
+# On a packed multi-bit register that is a whole-register rollback, not a
+# single-cell fault. It was measured directly (fi_tmr_diag, FT_ON build,
+# `uop_done_tmr`, 24 bit): rising-edge reads were stale on 75152/75152 update
+# cycles, and replaying the read-modify-write with an EMPTY mask -- flipping
+# nothing at all -- still drove the register's update rate from 25.34% to
+# 0.00%. Under the old rising-edge `stuck`, every TMR copy was frozen at once,
+# which no voter can correct; the resulting 12/12 DUE-hang measured the
+# injector rather than the design.
+#
+# `transient_bit_flip` was already written this way (it had to be, to align to
+# a write edge); the reasoning applies just as much to the other two.
 # ---------------------------------------------------------------------------
 async def persistent_bit_flip(clock, signal, bit_index):
     """SEU: flip one bit once and leave it. The cell keeps the flipped value
     until the design naturally overwrites it (next write / scrub / reset).
-    Canonical SEU model for flip-flops and SRAM bit cells."""
-    await RisingEdge(clock)
+    Canonical SEU model for flip-flops and SRAM bit cells.
+
+    Falling edge, so the read-modify-write cannot roll the rest of the handle
+    back to its pre-edge value (see the section comment above)."""
+    await FallingEdge(clock)
     width = len(signal)
     if not 0 <= bit_index < width:
         raise IndexError(f"bit_index {bit_index} out of range [0,{width})")
-    signal.value = int(signal.value) ^ (1 << bit_index)
+    cur = int(signal.value)
+    signal.value = cur ^ (1 << bit_index)
+
+
+async def persistent_multi_flip(clock, cells):
+    """SEU on several bits at once, correct even when they share a handle.
+
+    `cells` is [(signal, bit_index), ...]. Two concurrent persistent_bit_flip
+    tasks on the SAME handle would each read-modify-write the whole register at
+    the same edge, so the second write overwrites the first and only one bit
+    ends up flipped. That is exactly the situation the TMR reverse control is
+    in: with `uop_done_tmr` all three copies live in ONE packed handle, and a
+    silently-single strike would leave the majority intact and 'prove' the
+    scheme works. Grouping the bits per handle makes it one masked write.
+    """
+    await FallingEdge(clock)
+    per_handle = {}
+    for signal, bit_index in cells:
+        if not 0 <= bit_index < len(signal):
+            raise IndexError(
+                f"bit_index {bit_index} out of range [0,{len(signal)})")
+        key = id(signal)
+        h, m = per_handle.get(key, (signal, 0))
+        per_handle[key] = (h, m | (1 << bit_index))
+    for signal, mask in per_handle.values():
+        signal.value = int(signal.value) ^ mask
+
+
+async def permanent_multi_stuck_at(clock, cells, value):
+    """Stuck-at on several bits at once, correct when they share a handle.
+
+    Same rationale as persistent_multi_flip, but re-forced every cycle."""
+    if value not in (0, 1):
+        raise ValueError(f"stuck value must be 0 or 1, got {value!r}")
+    per_handle = {}
+    for signal, bit_index in cells:
+        if not 0 <= bit_index < len(signal):
+            raise IndexError(
+                f"bit_index {bit_index} out of range [0,{len(signal)})")
+        key = id(signal)
+        h, m = per_handle.get(key, (signal, 0))
+        per_handle[key] = (h, m | (1 << bit_index))
+    while True:
+        await FallingEdge(clock)
+        for signal, mask in per_handle.values():
+            try:
+                cur = int(signal.value)
+            except Exception:  # noqa: BLE001 - X during reset
+                continue
+            new = (cur | mask) if value else (cur & ~mask)
+            if new != cur:
+                signal.value = new
 
 
 async def transient_bit_flip(clock, signal, bit_index, e_handle=None,
@@ -541,7 +800,13 @@ async def transient_bit_flip(clock, signal, bit_index, e_handle=None,
 async def permanent_stuck_at(clock, signal, bit_index, value):
     """Hard fault: force the bit to `value` every cycle until cancelled. The
     design's writes are observed but immediately overwritten, simulating a
-    broken cell. Spawn with cocotb.start_soon and kill at end of run."""
+    broken cell. Spawn with cocotb.start_soon and kill at end of run.
+
+    Falling edge, and this one matters most: it re-forces the bit on EVERY
+    cycle, so a rising-edge read-modify-write would reimpose a stale value on
+    the rest of the handle every cycle for the whole run -- freezing the
+    entire register rather than breaking one cell (see the section comment
+    above for the measurement)."""
     if value not in (0, 1):
         raise ValueError(f"stuck value must be 0 or 1, got {value!r}")
     width = len(signal)
@@ -549,7 +814,7 @@ async def permanent_stuck_at(clock, signal, bit_index, value):
         raise IndexError(f"bit_index {bit_index} out of range [0,{width})")
     mask = 1 << bit_index
     while True:
-        await RisingEdge(clock)
+        await FallingEdge(clock)
         try:
             cur = int(signal.value)
         except Exception:  # noqa: BLE001 - X during reset; retry next cycle
@@ -628,8 +893,17 @@ async def probe_deposit(clock, signal, bit_index, *, phase="pose",
     bit-for-bit, including the injection phase, so that it is a valid control
     for them. `phase` selects where in the cycle the deposit happens:
 
-      "pose"  right after RisingEdge   -- identical to the production primitives
-      "nege"  right after FallingEdge  -- candidate fix (mid-cycle strike)
+      "nege"  right after FallingEdge  -- identical to the production
+                                          primitives, all of which now strike
+                                          mid-cycle
+      "pose"  right after RisingEdge   -- the OLD production phase, kept only
+                                          as a diagnostic. A read here returns
+                                          the pre-edge value, so the whole-
+                                          handle write-back rolls every other
+                                          bit of the register back one cycle
+                                          (see the bit-flip primitives section
+                                          comment). Do not use it as the
+                                          control for a campaign.
 
     Read-back uses clock edges only (no ReadOnly / delta assumptions): the
     falling edge is a point where the deposit has certainly been applied and

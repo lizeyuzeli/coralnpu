@@ -31,6 +31,11 @@ Env knobs (all optional):
     FI_N           runs per group                                        (50)
     FI_SEED        RNG seed (deterministic re-runs)                      (0xC0DE)
     FI_DUMP_HIERARCHY  if set, dump cocotb hierarchy (depth 4) then run.
+    FI_TMR_DEFEAT  reverse control: strike TWO TMR copies of one logical
+                   bit per run instead of one cell. Requires an FT_ON
+                   build; asserts that the runs DO break the design. Not
+                   a fault model and not part of the matrix -- see
+                   _make_defeat_cb and fi_utils.tmr_logical_map.
 
 Design notes:
   * Single fault per run only. Cumulative-fault stress and activity-gating
@@ -191,11 +196,64 @@ def _make_inject_cb(target, local_bit, inject_cycle, fault_type, stuck_val,
     return _cb, state
 
 
+def _make_defeat_cb(cells, inject_cycle, fault_type, stuck_val,
+                    set_timeout=None):
+    """Reverse control: inject the same logical bit in TWO TMR copies at once.
+
+    `cells` is [(target, local_bit), ...] for one logical bit, of which the
+    first two are struck. Breaking the majority is not a fault model -- it is
+    the only way to prove the injector is bound to the redundant storage rather
+    than to the voter's output, since both bindings otherwise yield an all-
+    MASKED table. See fi_utils.tmr_logical_map.
+
+    `state["fired"]` is AND-ed across the copies: for `set`, a defeat only
+    counts if every strike actually landed on a write."""
+    state = {"fired": True}
+    sub = []
+    for target, lbit in cells:
+        e_handle, _ = fi_utils.enable_handles(target)
+        sub.append((target["handle"], lbit, e_handle, {"fired": True}))
+
+    async def _cb(dut, clock, holders):
+        if inject_cycle > 0:
+            await ClockCycles(clock, inject_cycle)
+        # One task covering every struck cell, never one task per cell. The
+        # copies of a packed register (uop_done_tmr holds all three) live in a
+        # single handle, so two independent read-modify-writes at the same edge
+        # would clobber each other and land only ONE bit -- a single-copy
+        # strike, which the voter correctly masks, making a broken control look
+        # like a working scheme. See fi_utils.persistent_multi_flip.
+        cells_hb = [(signal, lbit) for signal, lbit, _e, _st in sub]
+        if fault_type == "stuck":
+            holders.append(cocotb.start_soon(
+                fi_utils.permanent_multi_stuck_at(clock, cells_hb, stuck_val)))
+            return
+        if fault_type == "seu":
+            # Both copies in the same cycle: a voter sees two-of-three wrong.
+            # Sequential strikes would let the scrub repair copy 0 before copy
+            # 1 is hit, which is single-fault tolerance working, not a defeat.
+            await fi_utils.persistent_multi_flip(clock, cells_hb)
+            return
+        if fault_type == "set":
+            tasks = [cocotb.start_soon(
+                fi_utils.transient_bit_flip(clock, signal, lbit,
+                                            e_handle=e, timeout_cycles=set_timeout,
+                                            state=st))
+                for signal, lbit, e, st in sub]
+            for t in tasks:
+                await t
+            state["fired"] = all(st.get("fired", False)
+                                 for _s, _b, _e, st in sub)
+            return
+        raise ValueError(f"unknown fault_type '{fault_type}'")
+    return _cb, state
+
+
 # Per-run CSV. Columns carry the group key (module + fault_type), the exact
 # injection site (target signal path + local/global bit), run status, and the
 # six-bucket outcome. Per-group layer/bucket shares live in fi_summary.csv.
 RESULT_FIELDS = [
-    "model", "module", "ft_scheme", "fault_type", "stuck_val",
+    "model", "module", "ft_scheme", "fault_type", "stuck_val", "ft_build",
     "run_id", "tag", "target_path", "local_bit", "global_bit",
     "fault_space_bits", "bit_live", "inject_cycle", "fault_fired", "halt_cycle",
     "halted", "faulted", "hung", "status",
@@ -203,7 +261,8 @@ RESULT_FIELDS = [
 ]
 
 SUMMARY_FIELDS = [
-    "model", "module", "ft_scheme", "fault_type", "stuck_val", "n_runs",
+    "model", "module", "ft_scheme", "fault_type", "stuck_val", "ft_build",
+    "n_runs",
     # three-layer shares over the whole fault space (raw AVF)
     "MASKED_pct", "SDC_pct", "DUE_pct",
     # six-bucket shares
@@ -232,7 +291,7 @@ def _layers(counts):
 
 def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
                  counts_live=None, live_bits=0, space=0,
-                 counts_fired=None, n_not_fired=0):
+                 counts_fired=None, n_not_fired=0, ft_build=""):
     n = sum(counts.values())
     layer = _layers(counts)
     counts_live = counts_live or {}
@@ -243,7 +302,8 @@ def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
     layer_fired = _layers(counts_fired)
     return {
         "model": model, "module": module, "ft_scheme": ft_scheme,
-        "fault_type": fault_type, "stuck_val": stuck_val, "n_runs": n,
+        "fault_type": fault_type, "stuck_val": stuck_val,
+        "ft_build": ft_build, "n_runs": n,
         "MASKED_pct": _pct(layer["MASKED"], n),
         "SDC_pct": _pct(layer["SDC"], n),
         "DUE_pct": _pct(layer["DUE"], n),
@@ -494,24 +554,46 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
     n_runs = int(os.environ.get("FI_N", _DEFAULT_N))
     rng = random.Random(seed)
 
+    # Which RTL build is under us. Probed from the hierarchy, never assumed:
+    # the FT switch is a `define in the RTL, so anything else could disagree
+    # with the model actually being simulated. It selects the FT_ON registry
+    # paths and is recorded in both CSVs -- an FT_ON and an FT_OFF campaign
+    # produce identically-shaped files, and telling them apart after the fact
+    # is the whole point of the comparison.
+    ft_on = fi_utils.ft_build_is_on(dut)
+    ft_build = "FT_ON" if ft_on else "FT_OFF"
+    # Reverse control (see fi_utils.tmr_logical_map): strike two TMR copies of
+    # one logical bit, which MUST break the design. Not a fault model, so it
+    # never runs as part of the matrix and its CSVs are tagged apart.
+    defeat = bool(os.environ.get("FI_TMR_DEFEAT"))
+    if defeat and not ft_on:
+        raise AssertionError(
+            "FI_TMR_DEFEAT needs a FAULT_TOLERANT_ON build: there is no "
+            "redundancy to defeat on a baseline build.")
+
     # CSV tag: identifies this target's group so parallel runs don't collide.
     tag_parts = []
     if module is not None:
         tag_parts.append(module)
     if fault_type is not None:
         tag_parts.append(fault_type)
+    if defeat:
+        tag_parts.append("tmrdefeat")
     csv_tag = ("_" + "_".join(tag_parts)) if tag_parts else ""
 
     cocotb.log.info(
-        "fi: model=%s seed=%d modules=%s fault_types=%s N=%d stuck_val=%d",
-        model_name, seed, modules, fault_types, n_runs, stuck_val)
+        "fi: model=%s seed=%d modules=%s fault_types=%s N=%d stuck_val=%d "
+        "build=%s%s",
+        model_name, seed, modules, fault_types, n_runs, stuck_val, ft_build,
+        " TMR-DEFEAT(reverse control)" if defeat else "")
 
     if os.environ.get("FI_DUMP_HIERARCHY"):
         cocotb.log.info("fi: dumping cocotb hierarchy (depth=4)")
         fi_utils.dump_hierarchy(dut, max_depth=4)
 
     # ---- Targets, collected up front so the golden run can measure liveness -
-    collected = {m: fi_utils.collect_targets(dut, m) for m in modules}
+    collected = {m: fi_utils.collect_targets(dut, m, ft_on=ft_on)
+                 for m in modules}
     live_masks = {m: [0] * len(collected[m]) for m in modules}
     live_period = int(os.environ.get("FI_LIVENESS_PERIOD",
                                      _DEFAULT_LIVENESS_PERIOD))
@@ -591,6 +673,24 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
             "fi: module '%s' (%s): %d targets, %d-bit fault space",
             module, ft_scheme, len(targets), space)
 
+        groups = None
+        if defeat:
+            groups = fi_utils.tmr_logical_map(targets)
+            expected_groups = space // fi_utils.FT_TMR_COPIES
+            assert len(groups) == expected_groups, (
+                f"fi: TMR-defeat found {len(groups)} complete logical bits in "
+                f"module '{module}', expected {expected_groups} "
+                f"({space} bit / {fi_utils.FT_TMR_COPIES} copies). The copy "
+                "annotation no longer matches the RTL, and an incomplete group "
+                "would strike fewer copies than the majority needs -- i.e. it "
+                "would silently become a single-fault run and 'prove' the "
+                "opposite of what this control is for.")
+            cocotb.log.info(
+                "fi: TMR-defeat: %d logical bits, striking %d of %d copies "
+                "each (reverse control -- non-MASKED outcomes are the PASS "
+                "criterion here, not a vulnerability)",
+                len(groups), 2, fi_utils.FT_TMR_COPIES)
+
         for fault_type in fault_types:
             counts = {b: 0 for b in fi_utils.OUTCOMES}
             counts_live = {b: 0 for b in fi_utils.OUTCOMES}
@@ -601,12 +701,21 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                 module, fault_type, n_runs)
             for _ in range(n_runs):
                 run_id += 1
-                gbit = rng.randrange(space)
                 inj_cycle = rng.randint(_INJECT_CYCLE_MIN, upper_cycle)
-                target, lbit = _locate_global_bit(targets, gbit)
-                cb, inj_state = _make_inject_cb(
-                    target, lbit, inj_cycle, fault_type, stuck_val,
-                    set_timeout=hang_timeout)
+                if defeat:
+                    gidx = rng.randrange(len(groups))
+                    cells = groups[gidx][:2]
+                    target, lbit = cells[0]
+                    gbit = gidx
+                    cb, inj_state = _make_defeat_cb(
+                        cells, inj_cycle, fault_type, stuck_val,
+                        set_timeout=hang_timeout)
+                else:
+                    gbit = rng.randrange(space)
+                    target, lbit = _locate_global_bit(targets, gbit)
+                    cb, inj_state = _make_inject_cb(
+                        target, lbit, inj_cycle, fault_type, stuck_val,
+                        set_timeout=hang_timeout)
                 res = await _run_once(
                     dut, fixture, elf_path, input_data, expected_output,
                     inject_cb=cb, timeout_cycles=hang_timeout)
@@ -628,8 +737,16 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     "model": model_name, "module": module,
                     "ft_scheme": ft_scheme, "fault_type": fault_type,
                     "stuck_val": (stuck_val if fault_type == "stuck" else ""),
-                    "run_id": run_id, "tag": "inject",
-                    "target_path": target["path"], "local_bit": lbit,
+                    "ft_build": ft_build,
+                    "run_id": run_id,
+                    "tag": ("tmr_defeat" if defeat else "inject"),
+                    # In defeat mode the row describes a logical bit, so the
+                    # path names every struck copy and global_bit is its index
+                    # among the logical bits, not among the physical cells.
+                    "target_path": (
+                        " + ".join(f"{t['path']}[{b}]" for t, b in cells)
+                        if defeat else target["path"]),
+                    "local_bit": lbit,
                     "global_bit": gbit, "fault_space_bits": space,
                     "bit_live": bit_live,
                     "inject_cycle": inj_cycle, "fault_fired": fired,
@@ -649,7 +766,7 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                 model_name, module, ft_scheme, fault_type, stuck_val, counts,
                 counts_live=counts_live, live_bits=live_bits.get(module, 0),
                 space=space, counts_fired=counts_fired,
-                n_not_fired=n_not_fired))
+                n_not_fired=n_not_fired, ft_build=ft_build))
             sum_f.flush()
             cocotb.log.info("fi: group module=%s fault_type=%s -> %s",
                             module, fault_type, counts)
@@ -660,6 +777,27 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     "fi:   %d/%d runs never expressed the fault (cell not "
                     "written again before end of run); excluded from *_fired",
                     n_not_fired, n_runs)
+            if defeat:
+                # Inverted verdict. Every MASKED run here is a run in which two
+                # of three copies were supposedly wrong and the design did not
+                # notice -- which does not mean the design is robust, it means
+                # the deposit did not reach the redundant storage. All-MASKED
+                # is therefore the failure, and it is fatal: it would otherwise
+                # be reported as a clean FT_ON campaign.
+                n_bad = sum(c for b, c in counts.items() if b != "MASKED")
+                cocotb.log.info(
+                    "fi:   TMR-defeat verdict: %d/%d runs broke the design "
+                    "(non-MASKED). Expected >0.", n_bad, n_runs)
+                assert n_bad > 0, (
+                    f"fi: TMR-defeat on '{module}'/{fault_type} produced "
+                    f"{n_runs} MASKED runs. Two of three copies of one logical "
+                    "bit were struck, so the majority voter had to yield a "
+                    "wrong value; a design that shrugs that off is not "
+                    "plausible. The injector is almost certainly not bound to "
+                    "the TMR storage (e.g. it is depositing on the voter's "
+                    "combinational output, where a deposit is recomputed "
+                    "away). Any FT_ON campaign taken from this build would "
+                    "report a perfect score for the wrong reason.")
 
     res_f.close()
     sum_f.close()
