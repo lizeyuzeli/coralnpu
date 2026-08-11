@@ -205,6 +205,47 @@ there are no `masked_tolerance` / `acc_degraded_threshold` knobs. This relies
 on a deterministic golden run; `run_campaign` runs golden twice up front and
 asserts the two outputs are bit-identical before trusting any outcome.
 
+### 3b. Hang attribution: `DUE-hang` is not one failure mode
+
+`DUE-hang` says only that the core stopped making progress. That is too coarse
+to price a recovery mechanism, because a watchdog can repair exactly one of the
+ways a core stops. Every hung run therefore gets a snapshot
+(`fi_utils.hang_snapshot`) taken **while the simulation is still up** — after
+the timeout fires, before the stuck-at holders are cancelled (lifting the fault
+first would let the design start moving again and the snapshot would describe a
+machine that is no longer hung).
+
+| `hang_class` | Signature | Watchdog? |
+|---|---|---|
+| `omission` | ROB entry valid & not done, **all RS empty** — the uop reached a unit and no result came back | ✅ the only recoverable class |
+| `starvation` | valid & not done, but **an RS still holds uops** — the stall is at/before dispatch | ❌ re-issue feeds a blocked queue |
+| `deadlock` | every valid entry **is** done, yet nothing retires — results arrived, the drain is wedged | ❌ re-issue adds traffic |
+| `external` | ROB fully drained — whatever stopped, it was not an RVV uop | ❌ out of scope |
+| `progressing` | ROB state still changing over 2000 cycles — thrashing, not a stalled entry | ❌ |
+| `unknown` | ROB could not be read | reported, never guessed |
+
+The `omission` / `starvation` split is the load-bearing one: both look like
+"valid but not done", and collapsing them would credit a watchdog with hangs
+that originate upstream of the execution units. Evidence columns
+(`stuck_entries`, `stuck_units`, `stuck_is_ft`, `rs_occupancy`, `rob_wptr/rptr`)
+go to the per-run CSV so a surprising class can be re-read instead of re-run.
+
+Physical vs program order: `uop_done` and the valid fifo's `mem` are both
+physical-entry indexed, so pairing them needs no rptr windowing. On an FT_ON
+build `uop_done` is read as the **majority of the three stored copies**, the
+same value the design's voter computes — reading the voted net would work too,
+but reading storage keeps the snapshot honest if a copy has diverged.
+
+**This is an instrument, so it needs its own control.** A snapshot that
+silently fails to resolve its hierarchy paths reports `unknown`/`external` for
+everything, which reads exactly like "there is no omission here" — the same
+class of trap as §1b. It was validated against `fifo_ptr/stuck` (a group that
+reliably hangs): 3/3 hangs resolved real state and classified `omission` with
+`rs_occupancy = [0 0 0 0]`. Note `entry_count`/`wptr`/`rptr` are multi_fifo
+output **nets**, which the vlt template does not expose; the reads fall back to
+the `cdffr` registers behind them (`u_entry_count_reg.q`, `u_wptr_reg.q`,
+`u_rptr_reg.q`).
+
 ---
 
 ## 4. Environment-variable reference

@@ -121,6 +121,15 @@ async def _run_once(dut, fixture, elf_path, input_data, expected_output,
     cycles, halted, faulted, hung = await _wait_for_outcome(
         dut, timeout_cycles)
 
+    # Attribute the hang BEFORE tearing anything down -- the ROB state that
+    # says which kind of hang this is only exists while the sim is still up,
+    # and the stuck-at holders must stay alive or the fault would lift and the
+    # design could start moving again mid-snapshot. DUE-hang alone cannot
+    # price a watchdog: only the `omission` class is recoverable by one.
+    hang_info = None
+    if hung:
+        hang_info = await fi_utils.hang_snapshot(dut, dut.io_aclk)
+
     # cancel(), not kill(): the latter is deprecated in cocotb 2.0.
     if inject_task is not None and not inject_task.done():
         inject_task.cancel()
@@ -153,6 +162,7 @@ async def _run_once(dut, fixture, elf_path, input_data, expected_output,
         "status": status, "bitexact": bitexact, "argmax_match": argmax_match,
         "actual_output": (actual_output.tolist()
                           if actual_output is not None else None),
+        "hang_info": hang_info,
     }
 
 
@@ -258,7 +268,15 @@ RESULT_FIELDS = [
     "fault_space_bits", "bit_live", "inject_cycle", "fault_fired", "halt_cycle",
     "halted", "faulted", "hung", "status",
     "output_bitexact", "argmax_match", "outcome",
+    # DUE-hang attribution (blank for every non-hung run). A watchdog can only
+    # recover hang_class == "omission"; see fi_utils.hang_snapshot.
+    "hang_class", "stuck_n", "stuck_entries", "stuck_units", "stuck_is_ft",
+    "rob_busy", "rob_wptr", "rob_rptr", "rs_occupancy",
 ]
+
+_HANG_FIELDS = ("hang_class", "stuck_n", "stuck_entries", "stuck_units",
+                "stuck_is_ft", "rob_busy", "rob_wptr", "rob_rptr",
+                "rs_occupancy")
 
 SUMMARY_FIELDS = [
     "model", "module", "ft_scheme", "fault_type", "stuck_val", "ft_build",
@@ -275,7 +293,17 @@ SUMMARY_FIELDS = [
     # runs whose fault was never expressed (set on a cell never written again);
     # they are NOT evidence of tolerance and are excluded from *_fired shares
     "n_runs_not_fired", "MASKED_pct_fired", "SDC_pct_fired", "DUE_pct_fired",
+    # How the DUE-hang runs break down. n_hang_omission is the only column a
+    # watchdog could turn into a recovered run; the rest are what it cannot
+    # help with, and reporting them together is the point (a bare DUE-hang
+    # count silently credits a watchdog with all three).
+    "n_hang", "n_hang_omission", "n_hang_starvation", "n_hang_deadlock",
+    "n_hang_external", "n_hang_progressing", "n_hang_unknown",
+    "omission_pct_of_hang",
 ]
+
+_HANG_CLASSES = ("omission", "starvation", "deadlock", "external",
+                 "progressing", "unknown")
 
 
 def _pct(n, total):
@@ -291,7 +319,8 @@ def _layers(counts):
 
 def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
                  counts_live=None, live_bits=0, space=0,
-                 counts_fired=None, n_not_fired=0, ft_build=""):
+                 counts_fired=None, n_not_fired=0, ft_build="",
+                 hang_counts=None):
     n = sum(counts.values())
     layer = _layers(counts)
     counts_live = counts_live or {}
@@ -300,6 +329,8 @@ def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
     counts_fired = counts_fired if counts_fired is not None else counts
     n_fired = sum(counts_fired.values())
     layer_fired = _layers(counts_fired)
+    hc = hang_counts or {c: 0 for c in _HANG_CLASSES}
+    n_hang = sum(hc.values())
     return {
         "model": model, "module": module, "ft_scheme": ft_scheme,
         "fault_type": fault_type, "stuck_val": stuck_val,
@@ -322,6 +353,14 @@ def _summary_row(model, module, ft_scheme, fault_type, stuck_val, counts,
         "MASKED_pct_fired": _pct(layer_fired["MASKED"], n_fired),
         "SDC_pct_fired": _pct(layer_fired["SDC"], n_fired),
         "DUE_pct_fired": _pct(layer_fired["DUE"], n_fired),
+        "n_hang": n_hang,
+        "n_hang_omission": hc["omission"],
+        "n_hang_starvation": hc["starvation"],
+        "n_hang_deadlock": hc["deadlock"],
+        "n_hang_external": hc["external"],
+        "n_hang_progressing": hc["progressing"],
+        "n_hang_unknown": hc["unknown"],
+        "omission_pct_of_hang": _pct(hc["omission"], n_hang),
     }
 
 
@@ -696,6 +735,7 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
             counts_live = {b: 0 for b in fi_utils.OUTCOMES}
             counts_fired = {b: 0 for b in fi_utils.OUTCOMES}
             n_not_fired = 0
+            hang_counts = {c: 0 for c in _HANG_CLASSES}
             cocotb.log.info(
                 "fi: ===== group module=%s fault_type=%s : %d runs =====",
                 module, fault_type, n_runs)
@@ -733,6 +773,9 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     counts_fired[outcome] += 1
                 else:
                     n_not_fired += 1
+                hang_info = res.get("hang_info")
+                if hang_info is not None:
+                    hang_counts[hang_info["hang_class"]] += 1
                 res_w.writerow({
                     "model": model_name, "module": module,
                     "ft_scheme": ft_scheme, "fault_type": fault_type,
@@ -760,18 +803,25 @@ async def run_campaign(dut, fixture, elf_path, input_data, expected_output,
                     "argmax_match": (res["argmax_match"]
                                      if res["argmax_match"] is not None else ""),
                     "outcome": outcome,
+                    **{k: (hang_info[k] if hang_info is not None else "")
+                       for k in _HANG_FIELDS},
                 })
                 res_f.flush()
             sum_w.writerow(_summary_row(
                 model_name, module, ft_scheme, fault_type, stuck_val, counts,
                 counts_live=counts_live, live_bits=live_bits.get(module, 0),
                 space=space, counts_fired=counts_fired,
-                n_not_fired=n_not_fired, ft_build=ft_build))
+                n_not_fired=n_not_fired, ft_build=ft_build,
+                hang_counts=hang_counts))
             sum_f.flush()
             cocotb.log.info("fi: group module=%s fault_type=%s -> %s",
                             module, fault_type, counts)
             cocotb.log.info("fi:   conditional (live bits only, n=%d) -> %s",
                             sum(counts_live.values()), counts_live)
+            if sum(hang_counts.values()):
+                cocotb.log.info(
+                    "fi:   hang attribution -> %s  (only 'omission' is "
+                    "watchdog-recoverable)", hang_counts)
             if n_not_fired:
                 cocotb.log.info(
                     "fi:   %d/%d runs never expressed the fault (cell not "

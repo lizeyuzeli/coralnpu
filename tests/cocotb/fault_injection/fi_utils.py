@@ -64,7 +64,7 @@ against:
 """
 
 import cocotb
-from cocotb.triggers import FallingEdge, RisingEdge
+from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge
 
 
 # Hierarchical prefix from the cocotb `dut` (the `RvvCoreMiniHighmemAxi`
@@ -124,6 +124,12 @@ FAULT_TYPES = ("seu", "set", "stuck")
 # and would also silently measure the voter instead of the storage. We take the
 # three copies, never the voted name.
 FT_TMR_COPIES = 3
+
+# ROB entry count (`ROB_DEPTH in rvv_backend_define.svh). Used by the hang
+# attribution snapshot to walk entries; the fault-space sizes below are
+# derived from the RTL independently, so a mismatch here cannot silently
+# change any measured number.
+ROB_DEPTH = 8
 
 # Fault space accounting, FT_OFF vs FT_ON. 25 protected bits become 75 real
 # flip-flops, and 75 is the honest denominator: TMR spends 3x the silicon, and
@@ -995,3 +1001,233 @@ def classify_outcome(*, hung, faulted, status, output_bitexact, argmax_match):
     if output_bitexact:
         return "MASKED"
     return "SDC-benign" if argmax_match else "SDC-critical"
+
+
+# ---------------------------------------------------------------------------
+# Hang attribution: is a DUE-hang an OMISSION, or something else?
+#
+# `DUE-hang` only says the core stopped making progress. That is not enough to
+# price a watchdog, because a watchdog can only recover ONE of the ways a core
+# hangs:
+#
+#   omission  a uop was issued and its result never came back. The ROB entry
+#             sits valid-but-not-done forever while the pipeline drains around
+#             it. This is exactly what a per-entry timeout detects, and (for a
+#             DMR-whitelisted uop) exactly what a re-issue can repair.
+#   deadlock  the result did come back, but a handshake downstream is wedged
+#             (RS/arbiter backpressure loop). Re-issuing adds traffic to a
+#             blocked path; a watchdog makes this worse, not better.
+#   external  the RVV backend is idle and the scalar core is what stopped.
+#             Out of scope entirely.
+#
+# Reading DUE-hang as if it were all omission is the mistake this snapshot
+# exists to prevent: it would credit a watchdog with recovering hangs no
+# watchdog can touch.
+#
+# Physical vs program order: `uop_done` and the valid fifo's `mem` are BOTH
+# physical-entry indexed (rvv_backend_rob.sv aligns res_mem/uop_done/trap_flag
+# with the fifo storage), so pairing them needs no rptr windowing. `uop_info`'s
+# fifo is windowed by rptr for its READERS, but we read its raw `mem` too and
+# index it physically, keeping every field of one entry consistent.
+# ---------------------------------------------------------------------------
+_ROB = RVV_BACKEND_PREFIX + ("u_rob",)
+
+
+def _read_int(dut, *paths):
+    """First of `paths` that resolves to an int-castable handle, else None.
+
+    Several of the values this snapshot wants (`entry_count`, `wptr`, `rptr`)
+    are multi_fifo OUTPUT NETS, and the vlt template only exposes `multi_fifo
+    -var mem` plus the DFF wrappers' `q` -- so the net name may not exist over
+    VPI at all. The register behind it always does (multi_fifo.sv drives each
+    from a cdffr: u_entry_count_reg / u_wptr_reg / u_rptr_reg), so we try the
+    net first and fall back to the cell. Returning None on both is reported as
+    `unknown`, never guessed around."""
+    for path in paths:
+        h = descend(dut, path)
+        if h is None:
+            continue
+        try:
+            return int(h.value)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _fifo_count(dut, root):
+    """Occupancy of the multi_fifo at `root` (net, else its cdffr)."""
+    return _read_int(dut, root + ("entry_count",),
+                     root + ("u_entry_count_reg", "q"))
+
+
+def _rob_ptrs(dut):
+    """(wptr, rptr) of the ROB, which are u_uop_info_fifo's pointers."""
+    fifo = _ROB + ("u_uop_info_fifo",)
+    return (_read_int(dut, _ROB + ("uop_wptr",), fifo + ("u_wptr_reg", "q")),
+            _read_int(dut, _ROB + ("uop_rptr",), fifo + ("u_rptr_reg", "q")))
+
+
+def _rob_entry_valid(dut):
+    """Physical-order entry_valid, read from the valid fifo's storage.
+
+    Not from the `entry_valid` net: on an FT_ON build that name is the majority
+    voter's combinational output, and on both builds it is the fifo's
+    rptr-windowed `fifo_data` view -- i.e. program order, which would not line
+    up with uop_done. `mem` is the storage itself, in physical order.
+    On FT_ON the fifo is triplicated; copy 0 is representative (if the copies
+    disagreed the voter would have corrected it, and a hang snapshot is not the
+    place to re-audit TMR)."""
+    for root in (_ROB + ("gen_uop_valid_fifo_tmr", 0, "u_uop_valid_fifo"),
+                 _ROB + ("u_uop_valid_fifo",)):
+        mem = descend(dut, root + ("mem",))
+        if mem is None:
+            continue
+        out = []
+        for e in range(ROB_DEPTH):
+            try:
+                out.append(int(mem[e].value) & 1)
+            except Exception:  # noqa: BLE001
+                return None
+        return out
+    return None
+
+
+def _rob_uop_done(dut):
+    """Physical-order uop_done. On FT_ON read the voted value the way the
+    design does: majority of the three stored copies."""
+    tmr = descend(dut, _ROB + ("uop_done_tmr",))
+    if tmr is not None:
+        try:
+            c = [int(tmr[i].value) for i in range(FT_TMR_COPIES)]
+            voted = (c[0] & c[1]) | (c[1] & c[2]) | (c[0] & c[2])
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        voted = _read_int(dut, _ROB + ("uop_done",))
+        if voted is None:
+            return None
+    return [(voted >> e) & 1 for e in range(ROB_DEPTH)]
+
+
+def _rob_stuck_entries(dut):
+    """Physical entries that are valid but not done -- the omission signature."""
+    ev = _rob_entry_valid(dut)
+    dn = _rob_uop_done(dut)
+    if ev is None or dn is None:
+        return None
+    return [e for e in range(ROB_DEPTH) if ev[e] and not dn[e]]
+
+
+def _entry_is_ft(dut, entry):
+    """(is_ft, ft_unit) of the uop occupying physical `entry`, or (None, None).
+
+    Only present on an FT_ON build (the fields are inside `ifdef
+    FAULT_TOLERANT_ON`). ft_flag/ft_unit in the ROB are already physical-order
+    mirrors of the fifo contents, which is what we want."""
+    flag = _read_int(dut, _ROB + ("ft_flag",))
+    if flag is None:
+        return None, None
+    unit = _read_int(dut, _ROB + ("ft_unit",))  # noqa: E501
+    u = None if unit is None else (unit >> (2 * entry)) & 0b11
+    return (flag >> entry) & 1, u
+
+
+def _rob_snap(dut):
+    done = _rob_uop_done(dut)
+    ev = _rob_entry_valid(dut)
+    return (_rob_ptrs(dut),
+            None if done is None else tuple(done),
+            None if ev is None else tuple(ev))
+
+
+async def _is_progressing(dut, clock, cycles=2000):
+    """True if ROB state changes at all over `cycles`.
+
+    A hang where the ROB keeps churning is not an omission on any single entry;
+    it is the pipeline thrashing (or the scalar core looping) with the backend
+    still alive."""
+    first = _rob_snap(dut)
+    for _ in range(cycles // 100):
+        await ClockCycles(clock, 100)
+        if _rob_snap(dut) != first:
+            return True
+    return False
+
+
+# Reservation stations, in ft_unit order (0=ALU, 1=MUL/MAC, 2=DIV, 3=FALU).
+# Their occupancy is what separates the two ways a ROB entry can sit
+# valid-but-not-done, which is the distinction the whole watchdog question
+# turns on:
+#
+#   RS empty     the uop already left the queue and is INSIDE an execution
+#                unit that never produced a result. This is the execution-unit
+#                omission a per-entry watchdog is meant to catch, and the only
+#                case where re-issuing the uop is the right response.
+#   RS occupied  the uop (or its predecessors) never got dispatched -- the
+#                queue itself is wedged, upstream of the unit. A watchdog would
+#                re-issue into a blocked queue.
+#
+# Collapsing these two into one "omission" number would inflate the watchdog's
+# apparent coverage with hangs it cannot fix.
+_RS_ROOTS = (("u_alu_rs",), ("u_mul_rs",), ("u_div_rs",), ("u_falu_rs",))
+
+
+def _rs_occupancy(dut):
+    """[entry_count per RS] in ft_unit order; None entries for absent units
+    (FALU only exists on a ZVE32F_ON build)."""
+    out = []
+    for root in _RS_ROOTS:
+        out.append(_fifo_count(dut, RVV_BACKEND_PREFIX + root))
+    return out
+
+
+async def hang_snapshot(dut, clock):
+    """Classify a hung run. Call while the sim is still up, right after the
+    timeout fires and before anything is torn down.
+
+    Returns a dict with `hang_class` in {omission, starvation, deadlock,
+    external, progressing, unknown} plus the evidence it was decided on, so a
+    surprising classification can be re-read from the CSV instead of re-run."""
+    out = {"hang_class": "unknown", "stuck_entries": "", "stuck_n": 0,
+           "stuck_units": "", "stuck_is_ft": "", "rob_busy": "",
+           "rob_wptr": "", "rob_rptr": "", "rs_occupancy": ""}
+    stuck = _rob_stuck_entries(dut)
+    if stuck is None:
+        # Could not read the ROB at all -- report that, never guess.
+        return out
+    ev = _rob_entry_valid(dut)
+    out["rob_busy"] = int(any(ev))
+    out["rob_wptr"], out["rob_rptr"] = _rob_ptrs(dut)
+    out["stuck_entries"] = " ".join(str(e) for e in stuck)
+    out["stuck_n"] = len(stuck)
+
+    if not any(ev):
+        # Backend fully drained: whatever stopped, it was not an RVV uop.
+        out["hang_class"] = "external"
+        return out
+    if await _is_progressing(dut, clock):
+        out["hang_class"] = "progressing"
+        return out
+    if not stuck:
+        # Entries are valid and every one of them is DONE, yet nothing retires:
+        # results arrived, the drain is what is wedged.
+        out["hang_class"] = "deadlock"
+        return out
+
+    fts, units = [], []
+    for e in stuck:
+        f, u = _entry_is_ft(dut, e)
+        fts.append("?" if f is None else str(f))
+        units.append("?" if u is None else str(u))
+    out["stuck_is_ft"] = " ".join(fts)
+    out["stuck_units"] = " ".join(units)
+
+    occ = _rs_occupancy(dut)
+    out["rs_occupancy"] = " ".join("?" if o is None else str(o) for o in occ)
+    # Anything still queued means the uops have not all reached a unit yet, so
+    # the stall is at or before dispatch rather than inside an execution unit.
+    if any(o for o in occ if o is not None):
+        out["hang_class"] = "starvation"
+    else:
+        out["hang_class"] = "omission"
+    return out
