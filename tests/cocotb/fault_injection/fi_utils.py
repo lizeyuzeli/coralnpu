@@ -29,16 +29,25 @@ tolerance schemes:
 
 A cell earns its place in this partition by representing real circuit error
 or by proving an FT mechanism works -- not by being a flip-flop. That is why
-the ROB data plane (`rob_data`) and the fifo bookkeeping (`fifo_ptr`) are
-registry entries but NOT analysis modules: see their `description` fields.
+the ROB data plane (`rob_data`), the LSU interface buffers (`lsu`) and the
+fifo bookkeeping (`fifo_ptr`) are registry entries but NOT analysis modules:
+see their `description` fields.
 
-Injection targets are reached through three Verilator `public_flat_rw`
-exposures (see rules/default.vlt.tpl):
+Injection targets are reached through three generic Verilator
+`public_flat_rw` exposures (see rules/default.vlt.tpl):
     edff.q          enable-DFF storage   (execution pipeline regs)
     cdffr.q         clear-DFF storage    (div/falu regs, fifo pointers*)
     multi_fifo.mem  fifo buffer cell     (queues, RS, result fifo)
-plus the ROB control regs (entry_valid/uop_done/trap_flag) and the VRF
-`vreg`, which carry their own dedicated vlt directives.
+plus per-name directives for the registers that are not wrapped in one of
+those: the ROB's uop_done / trap_flag / res_mem, and on an FT_ON build the
+*_tmr copies, retry_cnt and replay_mem. `entry_valid` and the VRF's `vreg`
+are deliberately NOT exposed -- both are combinational outputs of the storage
+below them, so a deposit would be recomputed away (INV-1).
+
+Whether that list still covers the design is not taken on trust: fi_audit.py
+reconciles it against the live hierarchy on every run of the fi_space_audit
+testcase, and fi_seq_audit.py reconciles the vlt template against the
+preprocessed RTL. Both halves are needed; see either docstring.
 
   *Partition rule (INV-3):* the injection space is partitioned BY SUB-MODULE,
   not assembled by enumerating registers that looked interesting. Every
@@ -135,8 +144,39 @@ ROB_DEPTH = 8
 # flip-flops, and 75 is the honest denominator: TMR spends 3x the silicon, and
 # every one of those cells is equally likely to be struck. Sampling only one
 # copy would quietly assume the redundancy is free.
-_COMPUTE_CTRL_BITS_OFF = 25
-_COMPUTE_CTRL_BITS_ON = _COMPUTE_CTRL_BITS_OFF * FT_TMR_COPIES
+_COMPUTE_CTRL_TMR_BITS = 25
+
+# The trap-in-flight flag (`cdffr trap_valid` -> `is_trapping`, rvv_backend.sv
+# root scope). Found outside every module's fault space by the Stage 5 space
+# audit, the same way `trap_ready` was found in Stage 3, and it is the other
+# half of that same handshake: trap_ready acknowledges to the scalar core,
+# is_trapping is what suppresses a second trap while one is in flight. NOT
+# triplicated, in either configuration -- so on an FT_ON build it is one
+# unprotected bit inside a module whose headline result is "AVF -> 0". That is
+# the honest reading and it is the point of counting it: the claim is about
+# the 25 bits TMR covers, not about the module.
+_TRAP_VALID_BITS = 1
+
+# FT_ON-only ROB bookkeeping added by Stage 5a (P0) and by the DMR retry cap.
+# got_first_tmr and ft_reinject_pend_tmr are triplicated; retry_cnt is not
+# (see its declaration comment in rvv_backend_rob.sv). All three are real
+# flip-flops that exist only when FAULT_TOLERANT_ON, and leaving them out was
+# understating the price of the mechanism by 88 bits.
+_FT_ROB_GOT_FIRST_BITS = ROB_DEPTH * FT_TMR_COPIES          # 24
+_FT_ROB_PEND_BITS = ROB_DEPTH * 2 * FT_TMR_COPIES           # 48
+_FT_ROB_RETRY_BITS = ROB_DEPTH * 2                          # 16, not TMR
+
+# `ft_ce_cnt` (16 bit) and `ft_tmr_disagree_q` (1 bit) are deliberately NOT
+# counted, and deliberately not exposed in the vlt template. They are the CE
+# instrument: nothing in the design reads them, so an upset there cannot
+# change any architectural outcome and would enter the denominator as 17 bits
+# of guaranteed-MASKED state -- which would make FT_ON look better than it is.
+# When the CE reporting CSR lands (it gives them a reader), they must be added
+# here; until then this is the conservative direction of the two.
+_COMPUTE_CTRL_BITS_OFF = _COMPUTE_CTRL_TMR_BITS + _TRAP_VALID_BITS
+_COMPUTE_CTRL_BITS_ON = (_COMPUTE_CTRL_TMR_BITS * FT_TMR_COPIES
+                         + _FT_ROB_GOT_FIRST_BITS + _FT_ROB_PEND_BITS
+                         + _FT_ROB_RETRY_BITS + _TRAP_VALID_BITS)
 
 
 def _ft_valid_fifo_root(copy):
@@ -156,8 +196,21 @@ def _ft_trap_ready_root(copy):
 # holds every copy, `copy*stride + logical_bit`; "copy" means this whole source
 # is one copy, and a target's offset within the source IS the logical bit.
 _COMPUTE_CTRL_SOURCES_FT = (
-    [{"root": ("u_rob",), "names": ["uop_done_tmr", "trap_flag_tmr"],
-      "tmr": {"packed": True, "stride": 8}}]
+    [{"root": ("u_rob",),
+      "names": ["uop_done_tmr", "trap_flag_tmr", "got_first_tmr"],
+      "tmr": {"packed": True, "stride": ROB_DEPTH}},
+     # Same packing, different stride: ft_reinject_pend_tmr is
+     # [COPIES][ROB_DEPTH][1:0], so one copy spans 2*ROB_DEPTH bits and the
+     # logical bit is entry*2+sub. A shared source entry would put stride 8 on
+     # it and silently pair copy 0's entry 4 with copy 1's entry 0 -- a
+     # "defeat" that flips three unrelated bits and cannot fail the voter,
+     # which reads as TMR working.
+     {"root": ("u_rob",), "names": ["ft_reinject_pend_tmr"],
+      "tmr": {"packed": True, "stride": ROB_DEPTH * 2}},
+     # Not triplicated, so no tmr annotation: the reverse control skips it and
+     # the campaign injects it as ordinary unprotected state.
+     {"root": ("u_rob",), "names": ["retry_cnt"]},
+     {"root": ("trap_valid",), "names": ["q"]}]
     + [{"root": _ft_valid_fifo_root(c), "walk": "mem",
         "tmr": {"group": "entry_valid", "copy": c}}
        for c in range(FT_TMR_COPIES)]
@@ -195,6 +248,16 @@ MODULES = {
             {"root": ("u_command_queue",), "walk": "mem"},
             {"root": ("u_legal_command_queue",), "walk": "mem"},
             {"root": ("u_uop_queue",), "walk": "mem"},
+            # Decode control state (`cdffr uop_index_cdffr` -> uop_index_
+            # remain, rvv_backend_decode_ctrl.sv): how many uops of the
+            # current instruction are still to be emitted. The three queues
+            # above are buffers; this is the only sequential CONTROL cell in
+            # the decode path, and it was outside every module's fault space
+            # until the Stage 5 audit. `walk` rather than a named path so a
+            # future decode register cannot re-open the same gap -- if one
+            # ever lands under a fifo here, the audit's overlap check fails
+            # rather than letting a pointer drift into this module (INV-3).
+            {"root": ("u_decode_de2",), "walk": "q"},
         ],
     },
     "compute_ctrl": {
@@ -221,6 +284,10 @@ MODULES = {
             # We take the edff's `q`, not the `trap_ready_rvv2rvs` net it
             # drives (INV-1: the net would be overwritten by the flop output).
             {"root": ("u_rob", "trap_ready"), "names": ["q"]},
+            # The other half of that handshake: `cdffr trap_valid` -> is_
+            # trapping, in the rvv_backend root scope rather than the ROB.
+            # Added in Stage 5 by the space audit (see _TRAP_VALID_BITS).
+            {"root": ("trap_valid",), "names": ["q"]},
         ],
         # FT_ON: the same 25 bits of state, now stored three times. See the
         # FT_TMR block above for the name mapping and for why the fault space
@@ -284,7 +351,25 @@ MODULES = {
             # a cell's content correlates with another's. Leaving them out
             # silently shrank the execute fault space by ~18%.
             {"root": ("gen_res_ff",), "walk": "mem"},
+            # Result-bus arbitration state: three arb_round_robin instances
+            # (arb_alu / arb_fmamac0 / arb_fmamac1), each an `edff
+            # priority_reg` holding the round-robin pointer. Six bits, at the
+            # far end of the same PU->ROB result path gen_res_ff starts, which
+            # is why they belong here and not in compute_ctrl: a flipped
+            # priority does not corrupt ROB control state, it hands the write
+            # port to the wrong unit. Outside every fault space until the
+            # Stage 5 audit.
+            {"root": ("u_arb",), "walk": "q"},
         ],
+        # FT_ON adds the DMR replay buffer. It lives in the rvv_backend root
+        # scope, not in the ROB, and it is a shadow copy of the RS payloads
+        # this module already injects -- same kind of state, same block, so it
+        # is the same module's fault space. It is also the single largest
+        # thing FAULT_TOLERANT_ON adds, and the reason the FT_ON denominator
+        # was wrong before Stage 5: leaving it out measured the mechanism's
+        # benefit while hiding its most exposed surface. Unprotected by
+        # construction (INV: replay_mem is the DMR common-mode point).
+        "sources_ft": None,  # filled in below, = sources + replay_mem
     },
     "storage": {
         "ft_scheme": "ecc",
@@ -294,6 +379,31 @@ MODULES = {
                        "onto that net would be overwritten by the edff output).",
         "sources": [
             {"root": ("u_vrf",), "walk": "q"},
+        ],
+    },
+    # ---- diagnostic item, NOT part of the analysis matrix (see `analysis`) --
+    "lsu": {
+        "ft_scheme": "none",
+        "analysis": False,
+        "description": "Vector load/store interface buffers: the RS holding "
+                       "uops on their way out to the scalar LSU, the map-info "
+                       "fifo, and the result fifo bringing loads back. 2296 "
+                       "bit -- the largest block of rvv_backend silicon that "
+                       "was outside every module's fault space, found by the "
+                       "Stage 5 space audit. Diagnostic rather than a fifth "
+                       "analysis module for the same reason as rob_data: no "
+                       "FT scheme in this project covers it, so its number "
+                       "decides nothing, and folding 2296 bit of buffer into "
+                       "the four-module ranking would distort it exactly the "
+                       "way rob_data's 2904 did in Stage 2. It is measured "
+                       "because the silicon flips regardless of whether we "
+                       "have a plan for it, and because 'not measured' and "
+                       "'not vulnerable' must never be the same entry in a "
+                       "results table. Pointers excluded (INV-3, fifo_ptr).",
+        "sources": [
+            {"root": ("u_lsu_rs",), "walk": "mem"},
+            {"root": ("u_lsu_map_info",), "walk": "mem"},
+            {"root": ("u_lsu_res",), "walk": "mem"},
         ],
     },
     # ---- diagnostic item, NOT part of the analysis matrix (see `analysis`) --
@@ -322,6 +432,13 @@ MODULES = {
             {"root": ("u_div_rs",), "walk": "q"},
             {"root": ("u_falu_rs",), "walk": "q"},
             {"root": ("gen_res_ff",), "walk": "q"},
+            # The three LSU-interface fifos. Their buffers are the `lsu`
+            # diagnostic item; their pointers are bookkeeping and belong here,
+            # by the same INV-3 rule that keeps every other fifo's pointers
+            # out of the block that owns its data.
+            {"root": ("u_lsu_rs",), "walk": "q"},
+            {"root": ("u_lsu_map_info",), "walk": "q"},
+            {"root": ("u_lsu_res",), "walk": "q"},
         ],
         # FT_ON: u_uop_valid_fifo is triplicated inside a generate scope, so
         # its pointer set is too (+2 copies). Every other fifo is untouched.
@@ -337,9 +454,18 @@ MODULES = {
             {"root": ("u_div_rs",), "walk": "q"},
             {"root": ("u_falu_rs",), "walk": "q"},
             {"root": ("gen_res_ff",), "walk": "q"},
+            {"root": ("u_lsu_rs",), "walk": "q"},
+            {"root": ("u_lsu_map_info",), "walk": "q"},
+            {"root": ("u_lsu_res",), "walk": "q"},
         ],
     },
 }
+
+# execute's FT_ON list is its FT_OFF list plus the DMR replay buffer; spelled
+# out here rather than duplicated so the two can never drift apart (every gap
+# this file guards against started as two lists that were meant to stay equal).
+MODULES["execute"]["sources_ft"] = (
+    MODULES["execute"]["sources"] + [{"root": (), "names": ["replay_mem"]}])
 
 MODULE_NAMES = tuple(MODULES.keys())
 
@@ -524,10 +650,19 @@ def collect_targets(dut, module_name, ft_on=None):
         if "names" in src:
             for nm in src["names"]:
                 h = getattr(root, nm, None)
-                if h is not None and _is_depositable(h):
-                    targets.append({"handle": h, "width": len(h),
-                                    "path": _path_str(base, (nm,)),
-                                    "owner": root, "kind": "name"})
+                # _flatten_targets, not a bare _is_depositable check: a named
+                # register can be an UNPACKED array (`logic [1:0] retry_cnt
+                # [ROB_DEPTH]`), which is not itself int-castable and would be
+                # skipped with a warning -- i.e. silently dropped from the
+                # fault space, the one failure mode this file exists to
+                # prevent. Flattening yields one target per element, the same
+                # granularity a `walk` produces for a fifo `mem`.
+                got = []
+                if h is not None:
+                    _flatten_targets(h, base + (nm,), got, owner=root,
+                                     kind="name")
+                if got:
+                    targets.extend(got)
                 else:
                     cocotb.log.warning(
                         "fi: module '%s' signal %s.%s missing/not depositable",

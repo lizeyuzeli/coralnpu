@@ -67,6 +67,29 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+# Static half of the reconciliation. Not a test: it reads a `verilator -E`
+# dump of the generated toplevel, which is a file the caller produces, so it
+# takes a path rather than a runfile. `bazel run` it as documented in the
+# script's docstring.
+py_binary(
+    name = "fi_seq_audit",
+    srcs = ["fi_seq_audit.py"],
+    visibility = ["//visibility:public"],
+)
+
+# Runtime half of the fault-space reconciliation (fi_seq_audit.py is the
+# static half and is not a bazel target: it reads `verilator -E` output, not a
+# running simulation). Depends on fi_utils because the audit reuses the
+# registry's own leaf flattening -- an audit that enumerated cells differently
+# from the injector would diff two things that were never comparable.
+py_library(
+    name = "fi_audit",
+    srcs = ["fi_audit.py"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [":fi_utils"],
+)
+
 py_library(
     name = "fi_campaign",
     srcs = ["fi_campaign.py"],

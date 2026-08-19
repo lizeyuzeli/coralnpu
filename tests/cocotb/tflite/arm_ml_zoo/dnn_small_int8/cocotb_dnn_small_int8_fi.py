@@ -34,6 +34,7 @@ from bazel_tools.tools.python.runfiles import runfiles
 
 from coralnpu_test_utils.sim_test_fixture import Fixture
 
+import fi_audit
 import fi_campaign
 import fi_utils
 
@@ -88,6 +89,18 @@ async def fi_deposit_probe(dut):
     await fi_campaign.run_probe(
         dut, fixture, elf_path, input_data, expected_output,
         model_name="dnn_small_int8")
+
+
+@cocotb.test()
+async def fi_space_audit(dut):
+    """Reconcile the campaign registry against the exposed RTL state.
+
+    Diagnostic, like fi_deposit_probe: it runs no workload and writes no CSV.
+    It needs only an elaborated hierarchy, so it takes the fixture (for the
+    reset that gives every cell a defined value -- an X-valued handle is not
+    int-castable and would be counted as not exposed) and stops there."""
+    await Fixture.Create(dut, highmem=True)
+    fi_audit.audit_fault_space(dut)
 
 
 @cocotb.test()

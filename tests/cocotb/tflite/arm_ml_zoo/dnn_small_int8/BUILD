@@ -133,11 +133,17 @@ DNN_SMALL_INT8_FI_TESTCASES = [
     "fi_storage_seu",
     "fi_storage_set",
     "fi_storage_stuck",
-    # Diagnostic item, not part of the 4-sub-module matrix (see fi_utils INV-3).
+    # Diagnostic items, not part of the 4-sub-module matrix (see fi_utils
+    # INV-3). lsu is the 2296-bit LSU-interface buffer set the Stage 5 space
+    # audit found outside every module's fault space.
+    "fi_lsu_seu",
+    "fi_lsu_set",
+    "fi_lsu_stuck",
     "fi_fifo_ptr_seu",
     "fi_fifo_ptr_set",
     "fi_fifo_ptr_stuck",
     "fi_deposit_probe",
+    "fi_space_audit",
     "fi_run_all",
 ]
 
@@ -159,6 +165,7 @@ cocotb_test_suite(
         "test_module": ["cocotb_dnn_small_int8_fi.py"],
         "deps": [
             "//tests/cocotb/fault_injection:fi_utils",
+            "//tests/cocotb/fault_injection:fi_audit",
             "//tests/cocotb/fault_injection:fi_campaign",
             "//coralnpu_test_utils:core_mini_axi_sim_interface",
             "//coralnpu_test_utils:sim_test_fixture",

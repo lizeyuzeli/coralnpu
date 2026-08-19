@@ -43,6 +43,29 @@ public_flat_rw -module "rvv_backend_rob"     -var "trap_flag_tmr"
 // directive of its own -- it is a multi_fifo, covered by the `mem` line below.
 public_flat_rw -module "rvv_backend_rob"     -var "res_mem"
 
+// FAULT_TOLERANT_ON only: the rest of the DMR/TMR bookkeeping, all of it real
+// flip-flops that exist only in that build. Every one of these was outside the
+// campaign's fault space until the Stage 5 space audit, which means the FT_ON
+// denominator counted the mechanism's benefit without counting its silicon.
+//   got_first_tmr / ft_reinject_pend_tmr  triplicated (Stage 5a), 24 + 48 bit
+//   retry_cnt                             NOT triplicated, 8 x 2 bit
+// The CE instrument (ft_ce_cnt, ft_tmr_disagree_q) is deliberately left
+// unexposed: nothing in the design reads it, so injecting it could only add
+// guaranteed-MASKED bits to the denominator. It gets a directive when the CE
+// reporting CSR gives it a reader.
+public_flat_rw -module "rvv_backend_rob"     -var "got_first_tmr"
+public_flat_rw -module "rvv_backend_rob"     -var "ft_reinject_pend_tmr"
+public_flat_rw -module "rvv_backend_rob"     -var "retry_cnt"
+
+// FAULT_TOLERANT_ON only: the DMR replay buffer (rvv_backend.sv root scope,
+// ROB_DEPTH x FT_RS_W). It holds a shadow copy of each in-flight RS payload so
+// a mismatched pair can be re-issued, which makes it both the largest single
+// thing FT adds and the mechanism's common-mode point -- a fault here is
+// replayed into BOTH copies, so DMR cannot see it. Exposing it is what lets
+// the execute module's FT_ON fault space include the cost of the scheme
+// instead of only its benefit.
+public_flat_rw -module "rvv_backend"         -var "replay_mem"
+
 // Expose the storage cell of the generic enable-DFF wrapper used throughout
 // the RVV backend. One directive makes every edff instance depositable: the
 // MAC / ALU / DIV / FALU pipeline registers AND the VRF storage cells (vreg
