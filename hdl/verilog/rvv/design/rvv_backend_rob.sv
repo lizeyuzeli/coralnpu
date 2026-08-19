@@ -122,22 +122,62 @@ module rvv_backend_rob
     logic     [`ROB_DEPTH-1:0][1:0]     reinject_accept;    // copies dispatched this cycle per entry (for pend decrement)
   // retry-exhaustion handoff: K rollbacks reached -> fall back to global trap (INV-5)
     logic     [`ROB_DEPTH-1:0]          ft_trap_req;        // this cycle's rollback would hit FT_RETRY_MAX
-  // ---- TMR of the ROB baseline control state (25 bit) -----------------
-  // uop_done / trap_flag / entry_valid / trap_ready are what the ROB state
-  // machine runs on: a single upset in any of them is enough to derail it
-  // (it is also the only analysis module where a `seu` produced SDC-critical
-  // outcomes). Each is stored FT_TMR_COPIES times and read back through a
-  // majority voter; the ORIGINAL name is kept for the voted net, so none of
-  // the readers further down change. This is register-only TMR -- the D-side
-  // logic cone stays shared, because what is being modelled is the control
-  // bits themselves flipping, not the logic that computes them.
+  // ---- TMR of the ROB control state (49 bit) --------------------------
+  // Two groups, protected the same way but for different reasons.
+  //
+  // (1) BASELINE state -- uop_done[8] / trap_flag[8] / entry_valid[8] /
+  //     trap_ready[1]. This is what the ROB state machine runs on: a single
+  //     upset in any of them is enough to derail it (it is also the only
+  //     analysis module where a `seu` produced SDC-critical outcomes).
+  //
+  // (2) DMR BOOKKEEPING state -- got_first[8] / ft_reinject_pend[16]. These
+  //     flops did not exist before FT; they are the DMR mechanism's own memory,
+  //     so leaving them bare means the fault-tolerance hardware is itself the
+  //     least protected thing in the module -- redundancy that cannot survive
+  //     a fault in its own control state does not close the loop it claims to.
+  //     Both failure directions are real and neither is caught by the DMR
+  //     compare itself, because the compare is what they gate:
+  //       got_first[e] 0->1 on a fresh entry: copy-1 is compared against the
+  //         PREVIOUS occupant's res_mem; if that stale payload happens to
+  //         match, the entry retires having been checked zero times -- DMR
+  //         silently degraded to no protection at all (SDC class).
+  //       got_first[e] 1->0: copy-2 is mistaken for copy-1, res_mem is
+  //         overwritten, no compare ever fires, uop_done is never set -> the
+  //         entry never retires and never traps (hang class).
+  //       ft_reinject_pend[e] ->0: the owed copy is never resent, so the
+  //         partner result never arrives -> same hang.
+  //       ft_reinject_pend[e] ->2 spuriously: extra copies are dispatched into
+  //         RS slots that nothing will ever consume.
+  //
+  // Each is stored FT_TMR_COPIES times and read back through a majority voter;
+  // the ORIGINAL name is kept for the voted net, so none of the readers
+  // further down change. This is register-only TMR -- the D-side logic cone
+  // stays shared, because what is being modelled is the control bits
+  // themselves flipping, not the logic that computes them.
   // entry_valid lives inside multi_fifo's `mem`, so it is triplicated by
   // instantiating the fifo three times (the IP itself is not touched).
-    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  uop_done_tmr;
-    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  trap_flag_tmr;
-    `FT_KEEP logic [`FT_TMR_COPIES-1:0]                  trap_ready_tmr;
-             logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]  entry_valid_tmr;      // fifo_data per copy
-             logic [`FT_TMR_COPIES-1:0][`NUM_RT_UOP-1:0] uop_valid_rob2rt_tmr; // dataout per copy
+  //
+  // retry_cnt[8][2] is deliberately NOT in this group. Its two failure
+  // directions are bounded and non-silent -- counting low delays the handoff to
+  // the trap path, counting high takes it early -- so it costs a spurious
+  // fail-stop or a few extra replays, never an unchecked retire and never a
+  // hang. It is the next candidate (+32 FF), not part of this step.
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]     uop_done_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]     trap_flag_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0]                     trap_ready_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]     got_first_tmr;
+    `FT_KEEP logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0][1:0] ft_reinject_pend_tmr;
+             logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]     entry_valid_tmr;      // fifo_data per copy
+             logic [`FT_TMR_COPIES-1:0][`NUM_RT_UOP-1:0]    uop_valid_rob2rt_tmr; // dataout per copy
+  // ---- TMR corrected-error (CE) counter -------------------------------
+  // A voter that is working is indistinguishable from a voter that is never
+  // needed: both look like a clean run. This counter is the only thing in the
+  // design that can tell those apart, so it is what turns "the regression
+  // passed" into "N faults were actually corrected".
+    logic                                              ft_tmr_disagree;    // some voter's inputs are not unanimous this cycle
+    logic                                              ft_tmr_disagree_q;
+    logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]         ft_ce_entry_valid;  // what u_vote_entry_valid actually reads
+    `FT_KEEP logic [`FT_CE_CNT_W-1:0]                  ft_ce_cnt;          // saturating CE event count
 `ifdef FT_INJECT_ON
   // self-test: force a one-time mismatch per FT entry to exercise the
   // duplicate->compare->rollback->retry->recover chain (see config.svh).
@@ -161,8 +201,9 @@ module rvv_backend_rob
 `ifdef FT_TMR_INJECT_ON
   // ---- TMR self-test sweeper ---------------------------------------
   // Walks the whole (protected bit x copy) space in one simulation, one point
-  // at a time: 25 bits = uop_done[8] + trap_flag[8] + trap_ready[1] +
-  // entry_valid[8], times FT_TMR_COPIES. A point is corrupted for the first
+  // at a time: 49 bits = uop_done[8] + trap_flag[8] + trap_ready[1] +
+  // entry_valid[8] + got_first[8] + ft_reinject_pend[8*2], times
+  // FT_TMR_COPIES. A point is corrupted for the first
   // half of its period and left alone for the second half, so each point tests
   // two things in turn -- the voter masking a live single-copy fault, and the
   // scrub pulling the beaten copy back to the majority once the fault stops.
@@ -171,7 +212,14 @@ module rvv_backend_rob
   // the copy's own bit. A flip can land on the value the copy was going to hold
   // anyway, which silently injects nothing and leaves that sweep point untested;
   // complement-of-majority is a guaranteed divergence at every point.
-  localparam int FT_TMR_INJ_BITS   = 3*`ROB_DEPTH + 1;
+  // Bit-index map (must stay in sync with the ft_tmr_hit_* decode below):
+  //   [0 .. RD)              uop_done[bit]
+  //   [RD .. 2RD)            trap_flag[bit-RD]
+  //   2RD                    trap_ready
+  //   (2RD .. 3RD]           entry_valid[bit-(2RD+1)]
+  //   (3RD .. 4RD]           got_first[bit-(3RD+1)]
+  //   (4RD .. 6RD]           ft_reinject_pend, 2 bit per entry, entry-major
+  localparam int FT_TMR_INJ_BITS   = 6*`ROB_DEPTH + 1;
   localparam int FT_TMR_INJ_POINTS = FT_TMR_INJ_BITS*`FT_TMR_COPIES;
   localparam int FT_TMR_PT_W       = $clog2(FT_TMR_INJ_POINTS+1);
   localparam int FT_TMR_CNT_W      = $clog2(`FT_TMR_INJ_PERIOD);
@@ -183,9 +231,12 @@ module rvv_backend_rob
     // simulation-only, so there is no flop to infer.
     logic [FT_TMR_CNT_W-1:0]        ft_tmr_inj_cnt = '0;
     logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_pt  = '0;
-    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_bit;   // 0..24, which protected bit
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_bit;   // 0..48, which protected bit
     logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_copy;  // which of the three copies
     logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_ent;   // entry index within its group
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_pd_off; // pend group: bit offset within the group
+    logic [FT_TMR_PT_W-1:0]         ft_tmr_inj_pd_ent; // pend group: entry index
+    logic                           ft_tmr_inj_pd_sub; // pend group: which of the 2 bit
     logic                           ft_tmr_inj_act;   // corrupting right now
     logic                           ft_tmr_inj_act_q;
     logic                           ft_tmr_inj_done_q = 1'b0;
@@ -193,6 +244,8 @@ module rvv_backend_rob
     logic                           ft_tmr_hit_trap;
     logic                           ft_tmr_hit_ready;
     logic                           ft_tmr_hit_valid;
+    logic                           ft_tmr_hit_first;
+    logic                           ft_tmr_hit_pend;
 
   always_ff @(posedge clk) begin
       if (ft_tmr_inj_pt < FT_TMR_INJ_POINTS) begin
@@ -209,15 +262,30 @@ module rvv_backend_rob
                            (ft_tmr_inj_cnt < (`FT_TMR_INJ_PERIOD/2));
   assign ft_tmr_inj_copy = ft_tmr_inj_pt % `FT_TMR_COPIES;
   assign ft_tmr_inj_bit  = ft_tmr_inj_pt / `FT_TMR_COPIES;
-  assign ft_tmr_inj_ent  = (ft_tmr_inj_bit <   `ROB_DEPTH) ?  ft_tmr_inj_bit
-                         : (ft_tmr_inj_bit < 2*`ROB_DEPTH) ?  ft_tmr_inj_bit -   `ROB_DEPTH
-                                                           :  ft_tmr_inj_bit - (2*`ROB_DEPTH+1);
+  assign ft_tmr_inj_ent  = (ft_tmr_inj_bit <    `ROB_DEPTH) ?  ft_tmr_inj_bit
+                         : (ft_tmr_inj_bit <  2*`ROB_DEPTH) ?  ft_tmr_inj_bit -   `ROB_DEPTH
+                         : (ft_tmr_inj_bit <= 3*`ROB_DEPTH) ?  ft_tmr_inj_bit - (2*`ROB_DEPTH+1)
+                                                            :  ft_tmr_inj_bit - (3*`ROB_DEPTH+1);
+  // pend carries 2 bit per entry, entry-major, so it needs both halves of the
+  // index. Valid only while ft_tmr_hit_pend; below its base the subtraction
+  // wraps and the value is meaningless (and unused).
+  assign ft_tmr_inj_pd_off = ft_tmr_inj_bit - (4*`ROB_DEPTH+1);
+  assign ft_tmr_inj_pd_ent = ft_tmr_inj_pd_off >> 1;
+  assign ft_tmr_inj_pd_sub = ft_tmr_inj_pd_off[0];
 
   assign ft_tmr_hit_done  = ft_tmr_inj_act && (ft_tmr_inj_bit <   `ROB_DEPTH);
   assign ft_tmr_hit_trap  = ft_tmr_inj_act && (ft_tmr_inj_bit >=  `ROB_DEPTH)
                                            && (ft_tmr_inj_bit < 2*`ROB_DEPTH);
   assign ft_tmr_hit_ready = ft_tmr_inj_act && (ft_tmr_inj_bit == 2*`ROB_DEPTH);
-  assign ft_tmr_hit_valid = ft_tmr_inj_act && (ft_tmr_inj_bit >  2*`ROB_DEPTH);
+  // entry_valid used to be the open-ended top of the map; now that got_first
+  // and pend sit above it, its range has to be closed at 3*ROB_DEPTH or every
+  // point in the two new groups would ALSO corrupt entry_valid and the sweep
+  // would stop testing one fault at a time.
+  assign ft_tmr_hit_valid = ft_tmr_inj_act && (ft_tmr_inj_bit >  2*`ROB_DEPTH)
+                                           && (ft_tmr_inj_bit <=3*`ROB_DEPTH);
+  assign ft_tmr_hit_first = ft_tmr_inj_act && (ft_tmr_inj_bit >  3*`ROB_DEPTH)
+                                           && (ft_tmr_inj_bit <=4*`ROB_DEPTH);
+  assign ft_tmr_hit_pend  = ft_tmr_inj_act && (ft_tmr_inj_bit >  4*`ROB_DEPTH);
 
   // The three flop groups are scrubbed, so once a point's injection window
   // closes they must re-converge on the next clock. Checking that here is what
@@ -230,19 +298,58 @@ module rvv_backend_rob
       if (rst_n && !ft_tmr_inj_act && !ft_tmr_inj_act_q) begin
           if ((uop_done_tmr[0]  != uop_done_tmr[1])  || (uop_done_tmr[1]  != uop_done_tmr[2]) ||
               (trap_flag_tmr[0] != trap_flag_tmr[1]) || (trap_flag_tmr[1] != trap_flag_tmr[2]) ||
-              (trap_ready_tmr[0]!= trap_ready_tmr[1])|| (trap_ready_tmr[1]!= trap_ready_tmr[2]))
+              (trap_ready_tmr[0]!= trap_ready_tmr[1])|| (trap_ready_tmr[1]!= trap_ready_tmr[2]) ||
+              (got_first_tmr[0] != got_first_tmr[1]) || (got_first_tmr[1] != got_first_tmr[2]) ||
+              (ft_reinject_pend_tmr[0] != ft_reinject_pend_tmr[1]) ||
+              (ft_reinject_pend_tmr[1] != ft_reinject_pend_tmr[2]))
               $error("FT_TMR: copies failed to scrub back after point %0d", ft_tmr_inj_pt);
       end
   end
 
+  // Simulation-only mirror of ft_ce_cnt. The real counter is cleared by rst_n,
+  // which is the correct hardware behaviour -- but the fixture calls reset()
+  // before every ELF, ~24 times inside one sweep, so the real counter can only
+  // ever report the fragment of the sweep since the last reset. Measured: it
+  // reads 0 at sweep end, which is indistinguishable from "the voter was never
+  // needed" -- the exact confusion the counter exists to prevent. This mirror
+  // is never reset (declaration-initialised, sim-only, no flop inferred) and so
+  // carries the whole-sweep total. Same edge definition, so the two agree over
+  // any window neither reset crosses.
+  // Expected >= FT_TMR_INJ_POINTS, not == (measured 502 for 147 points). A
+  // point produces more than one edge whenever the copies momentarily re-agree
+  // inside its window, and there are two ways that happens: a fixture reset
+  // clears every copy, and -- more often -- the injected value is the
+  // complement of the CURRENT voted bit while the other copies take the NEXT
+  // state, so on any cycle where that bit is transitioning the complement can
+  // land on exactly the value the others are moving to. Both re-diverge on the
+  // following clock. The count is therefore a lower-bounded liveness check, not
+  // an equality; only a count BELOW the point total is a defect.
+    int ft_ce_cnt_sweep = 0;
+  always_ff @(posedge clk)
+      if (ft_tmr_disagree && !ft_tmr_disagree_q) ft_ce_cnt_sweep <= ft_ce_cnt_sweep + 1;
+
   // A silent pass means nothing unless the sweep actually reached the last
   // point: a run that ends mid-sweep looks exactly like a clean one. The point
   // trace plus the completion line are what make the regression result evidence
-  // -- one line per point, 75 in total, so it stays readable in the test log.
+  // -- one line per point, 147 in total, so it stays readable in the test log.
   always_ff @(posedge clk) begin
       if ((ft_tmr_inj_pt == FT_TMR_INJ_POINTS) && !ft_tmr_inj_done_q) begin
           ft_tmr_inj_done_q <= 1'b1;
-          $display("FT_TMR: sweep complete, %0d points covered", FT_TMR_INJ_POINTS);
+          // The CE count is the half of the result the pass/fail cannot carry:
+          // "regression passed" says nothing was corrupted OR everything was
+          // corrected, and only this number tells which. It should be at least
+          // FT_TMR_INJ_POINTS -- one event per point -- so a count below that
+          // means points were swept past without ever diverging, i.e. the sweep
+          // tested less than it reported.
+          // Both counters are printed on purpose: the gap between them is the
+          // reset-clearing behaviour of the architectural counter, and hiding
+          // it would be the same class of mistake as trusting a reset-able
+          // sweep counter.
+          $display("FT_TMR: sweep complete, %0d points covered, %0d corrected errors counted (arch counter since last reset: %0d)",
+                   FT_TMR_INJ_POINTS, ft_ce_cnt_sweep, ft_ce_cnt);
+          if (ft_ce_cnt_sweep < FT_TMR_INJ_POINTS)
+              $error("FT_TMR: only %0d corrected errors for %0d points -- points were swept past without diverging",
+                     ft_ce_cnt_sweep, FT_TMR_INJ_POINTS);
       end
       else if (ft_tmr_inj_act && (ft_tmr_inj_cnt == '0))
           $display("FT_TMR: point %0d (bit %0d copy %0d)", ft_tmr_inj_pt, ft_tmr_inj_bit, ft_tmr_inj_copy);
@@ -627,24 +734,88 @@ module rvv_backend_rob
         end
     end
 
-  // ---- DMR per-entry state: got_first / retry_cnt ---------------------
+  // ---- DMR per-entry state: got_first (TMR) ---------------------------
   // got_first: set when the first copy is latched (branch b); cleared on
   //   pass/rollback (entry resolved) or when the entry retires/flushes.
-  // retry_cnt: bumped on each rollback; reaching FT_RETRY_MAX hands off to
-  //   the existing global trap path (wired in a later step).
+  // Triplicated, same shape as uop_done / trap_flag: every copy computes its
+  // next state from the VOTED value, so the D-side cone stays shared and the
+  // copies cannot diverge on their own, and the unconditional
+  // `got_first_tmr[i] <= got_first` scrub is what makes an upset CORRECTED
+  // rather than merely outvoted. That matters more here than anywhere else in
+  // the module: got_first is only written on the two cycles that open and close
+  // an entry's comparison, so without the scrub an upset copy would sit wrong
+  // for the entire lifetime of the entry -- exactly the window in which a
+  // second upset in the other 7 bit would break the majority.
+  // The per-entry branches below override the scrub bit-wise (NBA last write).
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_got_first_tmr
+      always_ff @(posedge clk or negedge rst_n) begin
+          if (!rst_n)
+              got_first_tmr[i] <= '0;
+          else if (trap_flush_rvv)
+              got_first_tmr[i] <= '0;
+          else begin
+              got_first_tmr[i] <= got_first;          // scrub from the majority
+              for (int e=0; e<`ROB_DEPTH; e++) begin
+                  if (ft_set_first[e])
+                      got_first_tmr[i][e] <= 1'b1;
+                  else if (ft_set_done[e] || ft_rollback[e])
+                      got_first_tmr[i][e] <= 1'b0;    // entry resolved this cycle
+              end
+`ifdef FT_TMR_INJECT_ON
+              // Sweep point, same placement rationale as uop_done: last in the
+              // chain so it beats the scrub and every functional write, and
+              // inside the else arm so reset and flush still dominate.
+              //
+              // What the negative control for THIS group does and does not
+              // show, measured, because the pass alone is misleading:
+              //   * 1 copy, complement-of-majority (this line): all 147 points
+              //     pass. The voter holds.
+              //   * 2 copies, complement-of-majority: ALSO passes -- and that
+              //     is an artefact, not a safety result. Once two copies carry
+              //     the complement the MAJORITY follows them, so the injected
+              //     value complements a value that is itself flipping: the bit
+              //     oscillates at 1/clk instead of being held wrong. A first
+              //     copy landing on a "1" cycle takes branch (c), mismatches
+              //     against stale res_mem, rolls back and replays within K.
+              //   * 2 copies, forced to a CONSTANT 0: hangs (reduction_m1
+              //     times out at run_to_halt). That is the predicted
+              //     got_first-1->0 failure -- copy-2 read as copy-1, res_mem
+              //     overwritten, no compare, uop_done never set.
+              // So this group's TMR is load-bearing, but only the stuck variant
+              // demonstrates it; complement-of-majority is the wrong defeat
+              // model for a bit whose damage comes from being HELD wrong.
+              // The other direction (got_first 0->1 -> compare against a stale
+              // res_mem that happens to match -> retire unchecked) cannot be
+              // shown by this sweep at all: skipping a DMR check only changes
+              // the architectural result if there is a data fault to miss, and
+              // the sweep injects no data fault. Demonstrating it needs
+              // FT_TMR_INJECT_ON and FT_INJECT_ON on the same entry, i.e. a
+              // two-fault experiment, which is outside the single-fault model
+              // this sweep is built on. Recorded as a known limit, not closed.
+              if (ft_tmr_hit_first && (ft_tmr_inj_copy==i))
+                  got_first_tmr[i][ft_tmr_inj_ent] <= ~got_first[ft_tmr_inj_ent];
+`endif
+          end
+      end
+    end
+  endgenerate
+
+  `FT_KEEP ft_voter #(.WIDTH(`ROB_DEPTH)) u_vote_got_first (
+        .d            (got_first_tmr),
+        .y            (got_first)
+  );
+
+  // ---- DMR per-entry state: retry_cnt (not TMR, see declaration) ------
+  // Bumped on each rollback; reaching FT_RETRY_MAX hands off to the existing
+  // global trap path via ft_trap_req below.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            got_first <= '0;
             for (int e=0; e<`ROB_DEPTH; e++) retry_cnt[e] <= 2'd0;
         end else if (trap_flush_rvv) begin
-            got_first <= '0;
             for (int e=0; e<`ROB_DEPTH; e++) retry_cnt[e] <= 2'd0;
         end else begin
             for (int e=0; e<`ROB_DEPTH; e++) begin
-                if (ft_set_first[e])
-                    got_first[e] <= 1'b1;
-                else if (ft_set_done[e] || ft_rollback[e])
-                    got_first[e] <= 1'b0;          // entry resolved this cycle
                 if (ft_rollback[e])
                     retry_cnt[e] <= retry_cnt[e] + 2'd1;
                 else if (ft_set_done[e])
@@ -683,26 +854,104 @@ module rvv_backend_rob
     end
 `endif
 
-  // ---- DMR reinject pending counter (physical order) ------------------
+  // ---- DMR reinject pending counter (physical order, TMR) -------------
   // copies still owed for an entry: a fresh FT push owes copy-2 (=1); a
   // rollback invalidates both stored copies and owes both (=2). Each accepted
   // handshake (dispatch grabbed a free RS slot) decrements; resolve/flush clears.
+  // Triplicated like got_first. Note the else arm here is a full assignment for
+  // every entry every cycle, so a separate scrub statement would be dead code:
+  // the decrement branch reads the VOTED ft_reinject_pend, which means it IS the
+  // scrub -- an upset copy is rewritten from the majority on the next clock
+  // whether or not a handshake happened (subtracting 0). Writing an explicit
+  // scrub first and letting the branches override it would be equivalent but
+  // would suggest the branches are partial, which they are not.
+  generate
+    for (i=0; i<`FT_TMR_COPIES; i++) begin : gen_ft_reinject_pend_tmr
+      always_ff @(posedge clk or negedge rst_n) begin
+          if (!rst_n)
+              for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend_tmr[i][e] <= 2'd0;
+          else if (trap_flush_rvv)
+              for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend_tmr[i][e] <= 2'd0;
+          else begin
+              for (int e=0; e<`ROB_DEPTH; e++) begin
+                  if (ft_set_done[e])
+                      ft_reinject_pend_tmr[i][e] <= 2'd0;      // entry resolved
+                  else if (ft_rollback[e])
+                      ft_reinject_pend_tmr[i][e] <= 2'd2;      // resend both copies
+                  else if (new_ft_push[e])
+                      ft_reinject_pend_tmr[i][e] <= 2'd1;      // owe copy-2
+                  else                                         // == scrub from majority
+                      ft_reinject_pend_tmr[i][e] <= ft_reinject_pend[e] - reinject_accept[e];
+              end
+`ifdef FT_TMR_INJECT_ON
+              // Sweep point, same placement rationale as uop_done. Indexed on
+              // both halves because this group is 2 bit wide per entry, and a
+              // point must corrupt exactly one bit: flipping the whole 2-bit
+              // field would be a double fault in the same voted group, which
+              // TMR is not claimed to survive.
+              // Negative control: striking 2 copies of these bits (and only
+              // these) fails the regression at point 103 -- bit 34, i.e.
+              // ft_reinject_pend[0][1] -- on a regfile assertion, while the
+              // 1-copy sweep passes all 147. Unlike got_first above, the
+              // complement model is potent here, because pend is a COUNT: a
+              // wrong value is acted on immediately (copies dispatched or not
+              // dispatched) rather than only gating a later comparison.
+              if (ft_tmr_hit_pend && (ft_tmr_inj_copy==i))
+                  ft_reinject_pend_tmr[i][ft_tmr_inj_pd_ent][ft_tmr_inj_pd_sub] <=
+                      ~ft_reinject_pend[ft_tmr_inj_pd_ent][ft_tmr_inj_pd_sub];
+`endif
+          end
+      end
+    end
+  endgenerate
+
+  `FT_KEEP ft_voter #(.WIDTH(2*`ROB_DEPTH)) u_vote_ft_reinject_pend (
+        .d            (ft_reinject_pend_tmr),
+        .y            (ft_reinject_pend)
+  );
+
+  // ---- TMR corrected-error (CE) counter -------------------------------
+  // Counts EVENTS, not disagreeing cycles: a real upset diverges for one clock
+  // and is scrubbed, but the FT_TMR_INJECT_ON sweeper holds a copy wrong for
+  // FT_TMR_INJ_PERIOD/2 cycles, and a cycle-counter would score those two the
+  // same fault hundreds of times apart. Edge-detecting the disagreement makes
+  // both read as 1, which is the only definition under which the self-test's
+  // count is comparable to a campaign's.
+  // Deliberately NOT cleared by trap_flush_rvv: this is a machine-check style
+  // accumulator, and a flush is precisely when a report must survive. Only
+  // rst_n clears it (a CSR write will, once the reporting port exists).
+  // Saturates instead of wrapping -- a wrapped count can read as zero, and
+  // "zero corrected errors" is the one answer that must never be a lie.
+  //
+  // CE is defined as "the voter's inputs were not unanimous", i.e. it is
+  // sampled where the voter reads, not where the flop lives. For the five flop
+  // groups those are the same net. For entry_valid they are not: its sweep
+  // points are applied on the voter input (the bits are inside the untouched
+  // fifo IP), so sampling entry_valid_tmr would report zero corrections for the
+  // whole entry_valid third of the sweep -- a counter that reads 0 exactly
+  // where the test is injecting is worse than no counter.
+`ifdef FT_TMR_INJECT_ON
+  assign ft_ce_entry_valid = entry_valid_tmr_inj;
+`else
+  assign ft_ce_entry_valid = entry_valid_tmr;
+`endif
+  assign ft_tmr_disagree =
+        |((uop_done_tmr[0]            ^ uop_done_tmr[1])            | (uop_done_tmr[1]            ^ uop_done_tmr[2]))
+      | |((trap_flag_tmr[0]           ^ trap_flag_tmr[1])           | (trap_flag_tmr[1]           ^ trap_flag_tmr[2]))
+      |  ((trap_ready_tmr[0]          ^ trap_ready_tmr[1])          | (trap_ready_tmr[1]          ^ trap_ready_tmr[2]))
+      | |((got_first_tmr[0]           ^ got_first_tmr[1])           | (got_first_tmr[1]           ^ got_first_tmr[2]))
+      | |((ft_reinject_pend_tmr[0]    ^ ft_reinject_pend_tmr[1])    | (ft_reinject_pend_tmr[1]    ^ ft_reinject_pend_tmr[2]))
+      | |((ft_ce_entry_valid[0]       ^ ft_ce_entry_valid[1])       | (ft_ce_entry_valid[1]       ^ ft_ce_entry_valid[2]))
+      | |((uop_valid_rob2rt_tmr[0]    ^ uop_valid_rob2rt_tmr[1])    | (uop_valid_rob2rt_tmr[1]    ^ uop_valid_rob2rt_tmr[2]));
+
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend[e] <= 2'd0;
-        else if (trap_flush_rvv)
-            for (int e=0; e<`ROB_DEPTH; e++) ft_reinject_pend[e] <= 2'd0;
-        else begin
-            for (int e=0; e<`ROB_DEPTH; e++) begin
-                if (ft_set_done[e])
-                    ft_reinject_pend[e] <= 2'd0;               // entry resolved
-                else if (ft_rollback[e])
-                    ft_reinject_pend[e] <= 2'd2;               // resend both copies
-                else if (new_ft_push[e])
-                    ft_reinject_pend[e] <= 2'd1;               // owe copy-2
-                else
-                    ft_reinject_pend[e] <= ft_reinject_pend[e] - reinject_accept[e];
-            end
+        if (!rst_n) begin
+            ft_tmr_disagree_q <= 1'b0;
+            ft_ce_cnt         <= '0;
+        end else begin
+            ft_tmr_disagree_q <= ft_tmr_disagree;
+            if (ft_tmr_disagree & (~ft_tmr_disagree_q) & (ft_ce_cnt != {`FT_CE_CNT_W{1'b1}}))
+                ft_ce_cnt <= ft_ce_cnt + 1'b1;
         end
     end
 

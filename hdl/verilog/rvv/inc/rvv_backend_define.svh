@@ -30,7 +30,7 @@
 //`define FT_INJECT_ON
 
 // TMR self-test — default OFF. Only meaningful with FAULT_TOLERANT_ON.
-// When ON, the ROB sweeps the entire (25 protected bit x FT_TMR_COPIES) space
+// When ON, the ROB sweeps the entire (49 protected bit x FT_TMR_COPIES) space
 // during one simulation: each point owns a FT_TMR_INJ_PERIOD-cycle slot, is
 // corrupted for the first half and left alone for the second, then the sweep
 // stops. The regression still passing is the assertion -- it means every one of
@@ -45,11 +45,22 @@
   `define FT_TMR_INJ_PERIOD 512
 `endif
 
-// TMR replication factor for the ROB baseline control state (uop_done /
-// trap_flag / entry_valid / trap_ready). Three is the only value the majority
-// voter `ft_voter` implements; the macro exists to name the copies, not to be
-// swept.
+// TMR replication factor for the ROB control state -- both the baseline part
+// (uop_done / trap_flag / entry_valid / trap_ready) and the DMR mechanism's own
+// bookkeeping (got_first / ft_reinject_pend). Three is the only value the
+// majority voter `ft_voter` implements; the macro exists to name the copies,
+// not to be swept.
 `define FT_TMR_COPIES 3
+
+// Width of the ROB's TMR corrected-error counter. Counts voter-input
+// disagreement EVENTS (edge-detected), saturating, cleared only by rst_n --
+// it is the mechanism's own evidence that a fault was corrected rather than
+// simply absent, and it is what the future reporting CSR will read. 16 bit
+// covers the 147-point self-test sweep with three orders of magnitude of
+// headroom, so saturation only ever happens under deliberate stress.
+`ifndef FT_CE_CNT_W
+  `define FT_CE_CNT_W 16
+`endif
 
 // TMR is deliberate redundancy: the three copies are logically equivalent, so
 // any optimizer may legally collapse them back into one and silently delete
