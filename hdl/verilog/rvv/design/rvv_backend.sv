@@ -1393,6 +1393,28 @@ module rvv_backend
       `endif
     );
     
+`ifdef FAULT_TOLERANT_ON
+`ifndef SYNTHESIS
+`ifdef TB_SUPPORT
+  // Exactly what the scalar core is handed when the back end gives up on a uop.
+  // The trap bit alone does not say whether the instruction can still complete
+  // (that is last_uop_valid) nor which PC to report (uop_pc), and both are read
+  // off this port by the integration layer -- so this is the one line that makes
+  // an FT trap in a simulation log attributable. Traced here rather than in
+  // retire, which has no clock of its own.
+    always_ff @(posedge clk) begin
+        if (rst_n) begin
+            for (int j=0;j<`NUM_RT_UOP;j++)
+                if (rd_valid_rob2rt_o[j] && rd_rob2rt_o[j].trap_flag)
+                    $display("FT: trapped uop retires: port %0d pc=0x%08h last_uop_valid=%0b w_valid=%0b",
+                             j, rd_rob2rt_o[j].uop_pc,
+                             rd_rob2rt_o[j].last_uop_valid, rd_rob2rt_o[j].w_valid);
+        end
+    end
+`endif
+`endif
+`endif
+
   `ifdef ZVE32F_ON
     // write back FRF.
     generate

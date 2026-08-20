@@ -198,6 +198,19 @@ module rvv_backend_rob
 
     genvar                              i,j;
 // ---code start------------------------------------------------------
+`ifdef FT_INJECT_PERSIST
+  // FT_INJECT_PERSIST only removes a gate inside the FT_INJECT_ON circuit, which
+  // in turn only exists under FAULT_TOLERANT_ON; with either missing it is
+  // compiled out entirely. Failing loudly is the point: a silent no-op would
+  // report "no trap ever fired" as a result about the design when it is really a
+  // result about the build.
+  `ifndef FT_INJECT_ON
+    initial $fatal(1, "FT_INJECT_PERSIST requires FT_INJECT_ON");
+  `endif
+  `ifndef FAULT_TOLERANT_ON
+    initial $fatal(1, "FT_INJECT_PERSIST requires FAULT_TOLERANT_ON");
+  `endif
+`endif
 `ifdef FT_TMR_INJECT_ON
   // ---- TMR self-test sweeper ---------------------------------------
   // Walks the whole (protected bit x copy) space in one simulation, one point
@@ -705,8 +718,17 @@ module rvv_backend_rob
               `ifdef FT_INJECT_ON
                 // self-test: on the entry's FIRST real comparison (2-same-cycle, or
                 // the 2nd copy arriving after got_first), force a one-time mismatch.
-                if (!injected[e] && ((ft_hit_cnt[e] == 2'd2) ||
-                                     ((ft_hit_cnt[e] == 2'd1) && got_first[e])))
+                // Under FT_INJECT_PERSIST the `injected` gate is dropped, so every
+                // retry re-injects and the entry walks retry_cnt up to
+                // FT_RETRY_MAX -- which is the ONLY deterministic way to drive
+                // ft_trap_req, and therefore the stimulus the reporting path is
+                // developed against. Deliberately failing, never a regression mode.
+                if (
+                  `ifndef FT_INJECT_PERSIST
+                    !injected[e] &&
+                  `endif
+                    ((ft_hit_cnt[e] == 2'd2) ||
+                     ((ft_hit_cnt[e] == 2'd1) && got_first[e])))
                     ft_inject_fire[e] = 1'b1;
               `endif
                 if (ft_hit_cnt[e] == 2'd2) begin            // branch (a): two same-cycle
@@ -834,6 +856,20 @@ module rvv_backend_rob
                               (retry_cnt[i] >= (`FT_RETRY_MAX-1));
     end
   endgenerate
+
+`ifndef SYNTHESIS
+  // Retry exhaustion is the one FT event that cannot be inferred from the test
+  // result: a run that traps and a run that never reaches the ROB both just fail
+  // to halt. Trace it so "the trap fired" is evidence and not an assumption.
+  always_ff @(posedge clk) begin
+      if (rst_n) begin
+          for (int e=0; e<`ROB_DEPTH; e++)
+              if (ft_trap_req[e])
+                  $display("FT: retry exhausted on ROB entry %0d (retry_cnt=%0d, K=%0d) -> trap_flag",
+                           e, retry_cnt[e], `FT_RETRY_MAX);
+      end
+  end
+`endif
 
 `ifdef FT_INJECT_ON
   // ---- DMR self-test: one-time fault injection bookkeeping ------------

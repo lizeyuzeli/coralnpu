@@ -155,11 +155,53 @@ class SCore(p: Parameters) extends Module {
   }
   fault_manager.io.in.memory_fault := lsu.io.fault
   if (p.enableRvv) {
-    fault_manager.io.in.rvv_fault.get.valid       := io.rvvcore.get.trap.valid
-    fault_manager.io.in.rvv_fault.get.bits.mepc   := io.rvvcore.get.trap.bits.pc
-    fault_manager.io.in.rvv_fault.get.bits.mcause := 2.U(32.W)
-    fault_manager.io.in.rvv_fault.get.bits.mtval  :=
+    // The vector unit reports faults from two different places.
+    //
+    // The front end reports at dispatch: an instruction it cannot decode, which
+    // is an illegal-instruction exception against that instruction.
+    //
+    // The back end reports at retire, via trap_flag on the writeback port: a
+    // uop whose execution could not be completed correctly -- the fault-tolerant
+    // build raises it once in-place retry is exhausted. The back end responds by
+    // flushing itself entirely, which destroys every vector uop still in flight,
+    // so without this report the retirement buffer would wait forever for
+    // writebacks that can no longer arrive (a hang), on top of retiring the
+    // failing instruction with data that was never written.
+    //
+    // Both must be reported in the cycle they are seen, not registered: the
+    // retirement buffer recognises the faulting instruction by comparing mepc
+    // against a live buffer entry, and one cycle later that entry is gone.
+    val rvvRetireTrap = VecInit(
+      (0 until p.instructionLanes).map(i =>
+        io.rvvcore.get.rd_rob2rt_o(i).valid && io.rvvcore.get.rd_rob2rt_o(i).trap_flag
+      )
+    )
+    val rvvRetireTrapValid = rvvRetireTrap.reduce(_ || _)
+    val rvvRetireTrapPc    = io.rvvcore.get.rd_rob2rt_o(PriorityEncoder(rvvRetireTrap)).uop_pc
+
+    // A retire-stage fault is always older than a dispatch-stage one, so it
+    // wins; the dispatch fault is not lost, because mepc points at the older
+    // instruction and the younger one is re-fetched on return.
+    fault_manager.io.in.rvv_fault.get.valid     :=
+      rvvRetireTrapValid || io.rvvcore.get.trap.valid
+    fault_manager.io.in.rvv_fault.get.bits.mepc := Mux(
+      rvvRetireTrapValid,
+      rvvRetireTrapPc,
+      io.rvvcore.get.trap.bits.pc
+    )
+    // 19 = hardware error: the instruction itself is legal, the machine failed
+    // to execute it. An illegal-instruction cause (2) would tell the handler to
+    // go and look at an encoding that is not the problem.
+    fault_manager.io.in.rvv_fault.get.bits.mcause := Mux(
+      rvvRetireTrapValid,
+      19.U(32.W),
+      2.U(32.W)
+    )
+    fault_manager.io.in.rvv_fault.get.bits.mtval := Mux(
+      rvvRetireTrapValid,
+      0.U,
       io.rvvcore.get.trap.bits.originalEncoding()
+    )
     fault_manager.io.in.rvv_fault.get.bits.decode := false.B
   }
   bru(0).io.fault_manager.get := fault_manager.io.out

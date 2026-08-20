@@ -349,6 +349,52 @@ async def rvv_exceptions_test(dut):
 
 
 @cocotb.test()
+async def rvv_ft_trap_test(dut):
+    """Unrecoverable vector-unit error is reported to the scalar core.
+
+    The program's own ISR does the checking (mcause == 19, mepc == the failing
+    vector instruction) and takes an ebreak if either is wrong, so reaching a
+    halt with io_fault low is the pass. Whether the trap happens at all depends
+    on the build -- it needs FAULT_TOLERANT_ON + FT_INJECT_ON +
+    FT_INJECT_PERSIST -- so the program reports which path it took and this test
+    logs it rather than asserting a value it cannot know. A silent pass here
+    means "no regression"; a pass with ft_trap_observed == 1 means the reporting
+    path was actually exercised.
+    """
+    if "Rvv" not in dut._name:
+        dut._log.info("Skipping rvv_ft_trap_test on non-RVV core")
+        return
+
+    fixture = await Fixture.Create(dut)
+    r = runfiles.Create()
+    elf = r.Rlocation("coralnpu_hw/tests/cocotb/rvv_ft_trap.elf")
+    await fixture.load_elf_and_lookup_symbols(
+        elf,
+        ["ft_trap_observed", "ft_trap_vstart", "ft_trap_mcause", "ft_trap_mepc"],
+    )
+    await fixture.run_to_halt(timeout_cycles=50000)
+    assert not fixture.fault()
+
+    async def read_u32(symbol):
+        return (await fixture.read_word(symbol)).view(np.uint32)[0]
+
+    observed = await read_u32("ft_trap_observed")
+    if observed == 1:
+        mcause = await read_u32("ft_trap_mcause")
+        mepc = await read_u32("ft_trap_mepc")
+        vstart = await read_u32("ft_trap_vstart")
+        dut._log.info(
+            "FT trap reported: mcause=%d mepc=0x%08x vstart=%d" %
+            (mcause, mepc, vstart)
+        )
+    else:
+        dut._log.info(
+            "No FT trap in this build (FAULT_TOLERANT_ON/FT_INJECT_ON/"
+            "FT_INJECT_PERSIST not all set); checked for no regression only"
+        )
+
+
+@cocotb.test()
 async def core_mini_axi_coralnpu_isa_test(dut):
     core_mini_axi = CoreMiniAxiInterface(dut)
     await core_mini_axi.init()

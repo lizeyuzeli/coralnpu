@@ -26,8 +26,26 @@
 // mismatch -> rollback -> retry -> recover to validate the whole
 // duplicate+compare+rollback chain. Must be one-time only: otherwise every
 // retry re-injects -> permanent mismatch -> hits K -> trap -> regression fail;
-// hence it relies on FT_RETRY_MAX>1 for recovery headroom.
+// hence it relies on FT_RETRY_MAX>1 for recovery headroom. That failing variant
+// is exactly what FT_INJECT_PERSIST below turns on, on purpose.
 //`define FT_INJECT_ON
+
+// FT_INJECT_ON, minus the one-time restriction — default OFF. Only meaningful
+// WITH FT_INJECT_ON (which itself needs FAULT_TOLERANT_ON); rvv_backend_rob.sv
+// $fatal's at elaboration if either is missing, because on its own this macro
+// compiles out and "no trap ever fired" would then be a fact about the build
+// masquerading as a fact about the design.
+// The only change is that the `injected` gate is dropped, so every retry
+// re-injects, retry_cnt walks up to FT_RETRY_MAX and ft_trap_req fires. That is
+// the ONLY deterministic way to reach the retry-exhausted trap, so it is the
+// stimulus the error-reporting path (trap -> scalar core -> mcause/mepc) is
+// developed and tested against.
+// This is a DELIBERATELY FAILING mode: with it on, an FT instruction never
+// recovers, so the ordinary regression is EXPECTED to fail. Never enable it in
+// a no-regression run -- the pass criterion for a FT_INJECT_PERSIST build is
+// "the trap handler was entered with the right mcause/mepc", not "the test
+// passed".
+//`define FT_INJECT_PERSIST
 
 // TMR self-test — default OFF. Only meaningful with FAULT_TOLERANT_ON.
 // When ON, the ROB sweeps the entire (49 protected bit x FT_TMR_COPIES) space

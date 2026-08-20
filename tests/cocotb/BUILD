@@ -40,6 +40,7 @@ COCOTB_TEST_BINARY_TARGETS = glob(["**/*.elf"]) + glob(["**/*.o"]) + [
     ":math.elf",
     ":minstret_test.elf",
     ":stress_test.elf",
+    ":rvv_ft_trap.elf",
     ":unreachable_prefetch_fault.elf",
     ":vector_store_fault.elf",
     ":wfi_slot_0.elf",
@@ -153,6 +154,7 @@ RVV_CORE_MINI_AXI_SIM_TESTCASES = [
     ("core_mini_axi_csr_test", "large"),
     "core_mini_axi_exceptions_test",
     "rvv_exceptions_test",
+    "rvv_ft_trap_test",
     "core_mini_axi_coralnpu_isa_test",
     ("core_mini_axi_rand_instr_test", "large"),
     ("core_mini_axi_burst_types_test", "large"),
@@ -678,6 +680,11 @@ coralnpu_v2_binary(
 coralnpu_v2_binary(
     name = "vector_store_fault",
     srcs = ["vector_store_fault.cc"],
+)
+
+coralnpu_v2_binary(
+    name = "rvv_ft_trap",
+    srcs = ["rvv_ft_trap.cc"],
 )
 
 cocotb_test_suite(
