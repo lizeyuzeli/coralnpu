@@ -28,6 +28,11 @@ class CsrRvvIO(p: Parameters) extends Bundle {
   val vxsat  = Input(Bool())
   // VME (Zvt). Tied to 0 when enableVme=false.
   val mtype = Input(UInt(p.xlen.W))
+  // Pulsed for one cycle when the vector back end reports an error it could not
+  // recover from. Latched into ftstatus, because the trap handler runs many
+  // cycles later and by then the pulse is long gone. Always present in the
+  // interface, and always 0 in a build without the fault-tolerant back end.
+  val ft_error = Input(Bool())
   // From Csr to RvvCore
   val vstart_write = Output(Valid(UInt(log2Ceil(p.rvvVlen).W)))
   val vxrm_write   = Output(Valid(UInt(2.W)))
@@ -77,6 +82,8 @@ object CsrAddress extends ChiselEnum {
   val MCONTEXT5 = Value(0x7c5.U(12.W))
   val MCONTEXT6 = Value(0x7c6.U(12.W))
   val MCONTEXT7 = Value(0x7c7.U(12.W))
+  // Custom machine RW. Vector-unit fault-tolerance status; see ftstatus below.
+  val FTSTATUS  = Value(0x7c8.U(12.W))
   val MPC       = Value(0x7e0.U(12.W))
   val MSP       = Value(0x7e1.U(12.W))
   val MCYCLE    = Value(0xb00.U(12.W))
@@ -318,6 +325,17 @@ class Csr(p: Parameters) extends Module {
   val mepc         = RegInit(0.U(p.programCounterBits.W))
   val mhartid      = RegInit(p.hartId.U(p.xlen.W))
 
+  // Vector-unit fault-tolerance status. Sticky: set by hardware, cleared only by
+  // software, so a handler that runs long after the event still sees it, and two
+  // errors between two clears do not look like one.
+  //   bit 0  ERR  an unrecoverable vector-unit error was reported
+  //   31:1        reserved, read as zero
+  // Plain RW rather than write-1-to-clear: wdata for a CSRRS with rs1=x0 is the
+  // read value itself, so under W1C a bare read of a set bit would clear it.
+  // With RW, `csrrc rd, ftstatus, 1` or `csrw ftstatus, x0` clears, and a bare
+  // read writes the value back unchanged.
+  val ftstatus = Option.when(p.enableRvv) { RegInit(0.U(p.xlen.W)) }
+
   val mcycle                    = RegInit(0.U(64.W))
   val minstret                  = RegInit(0.U(64.W))
   val minstretThisCycle_delayed = Wire(UInt(64.W))
@@ -386,6 +404,7 @@ class Csr(p: Parameters) extends Module {
   val mcontext5En = csr_address === CsrAddress.MCONTEXT5
   val mcontext6En = csr_address === CsrAddress.MCONTEXT6
   val mcontext7En = csr_address === CsrAddress.MCONTEXT7
+  val ftstatusEn  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTSTATUS }
   val mpcEn       = csr_address === CsrAddress.MPC
   val mspEn       = csr_address === CsrAddress.MSP
   // M-mode performance CSRs.
@@ -500,12 +519,13 @@ class Csr(p: Parameters) extends Module {
       Option
         .when(p.enableRvv) {
           Seq(
-            vstartEn.get -> io.rvv.get.vstart,
-            vlEn.get     -> io.rvv.get.vl,
-            vtypeEn.get  -> io.rvv.get.vtype,
-            vxrmEn.get   -> io.rvv.get.vxrm,
-            vxsatEn.get  -> io.rvv.get.vxsat,
-            vlenbEn.get  -> 16.U(32.W) // Vector length in Bytes
+            vstartEn.get   -> io.rvv.get.vstart,
+            vlEn.get       -> io.rvv.get.vl,
+            vtypeEn.get    -> io.rvv.get.vtype,
+            vxrmEn.get     -> io.rvv.get.vxrm,
+            vxsatEn.get    -> io.rvv.get.vxsat,
+            vlenbEn.get    -> 16.U(32.W), // Vector length in Bytes
+            ftstatusEn.get -> ftstatus.get
           )
         }
         .getOrElse(Seq())
@@ -579,6 +599,13 @@ class Csr(p: Parameters) extends Module {
     io.rvv.get.vxrm_write.bits    := wdata(1, 0)
     io.rvv.get.vxsat_write.valid  := req.valid && vxsatEn.get
     io.rvv.get.vxsat_write.bits   := wdata(0)
+
+    // Hardware set wins over a software write in the same cycle: an error that
+    // lands while the handler is clearing the flag must not be swallowed, or the
+    // one case the register exists for -- a second error during recovery from
+    // the first -- would read back as clean.
+    val ftstatusWritten = Mux(req.valid && ftstatusEn.get, wdata, ftstatus.get)
+    ftstatus.get := ftstatusWritten | Cat(0.U((p.xlen - 1).W), io.rvv.get.ft_error)
   }
 
   // mcycle implementation

@@ -28,6 +28,14 @@
 //   ft_trap_observed == 1 -> trap delivered, and mcause/mepc/mtval were correct.
 // A wrong mcause or a wrong mepc is not recorded as either: it takes the ebreak
 // below, so it cannot be mistaken for the no-trap case.
+//
+// It also checks ftstatus (0x7c8), the sticky record of the same event. The
+// trap is an interrupt in time -- it is delivered once and then it is over --
+// so a status bit that outlives it is what lets anything other than the handler
+// itself (a later health check, a supervisor, a post-mortem) learn that the
+// vector unit failed. Both halves are checked here: that the bit is set on
+// arrival, and that software can clear it, since a bit that cannot be cleared
+// reports every future error as already-known.
 
 #include <riscv_vector.h>
 #include <cstdint>
@@ -43,6 +51,9 @@ volatile uint32_t ft_trap_observed = 0;
 volatile uint32_t ft_trap_vstart = 0xffffffff;
 volatile uint32_t ft_trap_mcause = 0xffffffff;
 volatile uint32_t ft_trap_mepc   = 0xffffffff;
+// ftstatus as read in the handler, and again after the handler cleared it.
+volatile uint32_t ft_trap_status         = 0xffffffff;
+volatile uint32_t ft_trap_status_cleared = 0xffffffff;
 
 void isr_wrapper(void);
 __attribute__((naked)) void isr_wrapper(void) {
@@ -66,6 +77,23 @@ __attribute__((naked)) void isr_wrapper(void) {
       "csrr t0, vstart \n"
       "la   t2, ft_trap_vstart \n"
       "sw   t0, 0(t2) \n"
+      // ftstatus.ERR records the same event for anyone who was not this
+      // handler. If the trap arrived, the bit must be set: a trap without the
+      // record would leave the error invisible one instruction later.
+      "csrr t0, 0x7c8 \n"
+      "la   t2, ft_trap_status \n"
+      "sw   t0, 0(t2) \n"
+      "andi t1, t0, 1 \n"
+      "beqz t1, 2f \n"
+      // And it must be clearable, or the next error can never be told apart
+      // from this one. Read back to check the clear took effect rather than
+      // assuming the write did anything.
+      "li   t1, 1 \n"
+      "csrrc t0, 0x7c8, t1 \n"
+      "csrr t0, 0x7c8 \n"
+      "la   t2, ft_trap_status_cleared \n"
+      "sw   t0, 0(t2) \n"
+      "bnez t0, 2f \n"
       "li   t0, 1 \n"
       "la   t2, ft_trap_observed \n"
       "sw   t0, 0(t2) \n"
@@ -87,7 +115,13 @@ int main(int argc, char** argv) {
       "ft_target: \n"
       "vadd.vi v1, v1, 1 \n");
 
-  // Reached only if the instruction did not trap.
+  // Reached only if the instruction did not trap. Report ftstatus anyway: in a
+  // build with no error, it must read zero. Without that check, a status bit
+  // wired to a constant 1 would still pass the trapping case above, and the
+  // register would be reporting the build rather than the machine.
+  uint32_t status;
+  asm volatile("csrr %0, 0x7c8" : "=r"(status));
+  ft_trap_status = status;
   ft_trap_observed = 0;
   asm volatile(".word 0x08000073");  // mpause (halt)
   return 0;

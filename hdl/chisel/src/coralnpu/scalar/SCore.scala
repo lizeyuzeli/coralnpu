@@ -203,6 +203,13 @@ class SCore(p: Parameters) extends Module {
       io.rvvcore.get.trap.bits.originalEncoding()
     )
     fault_manager.io.in.rvv_fault.get.bits.decode := false.B
+
+    // Same event, second consumer: the trap tells software an error happened
+    // right now, ftstatus lets it still find out later. Driven from here rather
+    // than beside the other csr.io.rvv connections because this is where the
+    // retire-stage trap is decoded; only the back-end error sets it -- a
+    // front-end illegal instruction is a software bug, not a hardware fault.
+    csr.io.rvv.get.ft_error := rvvRetireTrapValid
   }
   bru(0).io.fault_manager.get := fault_manager.io.out
 

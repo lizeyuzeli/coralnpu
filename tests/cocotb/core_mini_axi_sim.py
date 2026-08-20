@@ -353,11 +353,12 @@ async def rvv_ft_trap_test(dut):
     """Unrecoverable vector-unit error is reported to the scalar core.
 
     The program's own ISR does the checking (mcause == 19, mepc == the failing
-    vector instruction) and takes an ebreak if either is wrong, so reaching a
-    halt with io_fault low is the pass. Whether the trap happens at all depends
-    on the build -- it needs FAULT_TOLERANT_ON + FT_INJECT_ON +
-    FT_INJECT_PERSIST -- so the program reports which path it took and this test
-    logs it rather than asserting a value it cannot know. A silent pass here
+    vector instruction, ftstatus.ERR set and then clearable) and takes an ebreak
+    if any is wrong, so reaching a halt with io_fault low is the pass. Whether
+    the trap happens at all depends on the build -- it needs FAULT_TOLERANT_ON
+    + FT_INJECT_ON + FT_INJECT_PERSIST -- so the program reports which path it
+    took and this test logs it rather than asserting a value it cannot know.
+    A silent pass here
     means "no regression"; a pass with ft_trap_observed == 1 means the reporting
     path was actually exercised.
     """
@@ -370,7 +371,14 @@ async def rvv_ft_trap_test(dut):
     elf = r.Rlocation("coralnpu_hw/tests/cocotb/rvv_ft_trap.elf")
     await fixture.load_elf_and_lookup_symbols(
         elf,
-        ["ft_trap_observed", "ft_trap_vstart", "ft_trap_mcause", "ft_trap_mepc"],
+        [
+            "ft_trap_observed",
+            "ft_trap_vstart",
+            "ft_trap_mcause",
+            "ft_trap_mepc",
+            "ft_trap_status",
+            "ft_trap_status_cleared",
+        ],
     )
     await fixture.run_to_halt(timeout_cycles=50000)
     assert not fixture.fault()
@@ -379,18 +387,25 @@ async def rvv_ft_trap_test(dut):
         return (await fixture.read_word(symbol)).view(np.uint32)[0]
 
     observed = await read_u32("ft_trap_observed")
+    status = await read_u32("ft_trap_status")
     if observed == 1:
         mcause = await read_u32("ft_trap_mcause")
         mepc = await read_u32("ft_trap_mepc")
         vstart = await read_u32("ft_trap_vstart")
+        cleared = await read_u32("ft_trap_status_cleared")
         dut._log.info(
-            "FT trap reported: mcause=%d mepc=0x%08x vstart=%d" %
-            (mcause, mepc, vstart)
+            "FT trap reported: mcause=%d mepc=0x%08x vstart=%d ftstatus=0x%08x "
+            "after clear=0x%08x" % (mcause, mepc, vstart, status, cleared)
         )
     else:
+        # Build-independent: no error means no error bit. Asserted rather than
+        # logged because a ftstatus stuck at 1 would otherwise pass every build
+        # -- it would satisfy the trapping case above for the wrong reason.
+        assert status == 0, f"ftstatus set without an FT error: 0x{status:08x}"
         dut._log.info(
             "No FT trap in this build (FAULT_TOLERANT_ON/FT_INJECT_ON/"
-            "FT_INJECT_PERSIST not all set); checked for no regression only"
+            "FT_INJECT_PERSIST not all set); ftstatus clean, checked for no "
+            "regression only"
         )
 
 
