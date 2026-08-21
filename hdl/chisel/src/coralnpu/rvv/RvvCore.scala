@@ -174,6 +174,14 @@ object GenerateCoreShimSource {
         |    output wr_vxsat_valid_o,
         |    output wr_vxsat_o,""".stripMargin
 
+    // Fault-tolerance event counters. Declared unconditionally: this wrapper is
+    // generated once and has to match RvvCore.sv, which ties both to 0 when the
+    // fault-tolerant back end is compiled out. That is what keeps
+    // FAULT_TOLERANT_ON a property of the vector back end alone (INV-1).
+    moduleInterface += """
+        |    output [31:0] ft_ce_cnt_o,
+        |    output [31:0] ft_dmr_cnt_o,""".stripMargin
+
     // Remove last comma/linebreak
     moduleInterface = moduleInterface.dropRight(1)
     moduleInterface += "\n);\n"
@@ -358,7 +366,9 @@ object GenerateCoreShimSource {
         |      .trap_valid_o(trap_valid),
         |      .trap_data_o(trap_data),
         |      .wr_vxsat_valid_o(wr_vxsat_valid_o),
-        |      .wr_vxsat_o(wr_vxsat_o)
+        |      .wr_vxsat_o(wr_vxsat_o),
+        |      .ft_ce_cnt_o(ft_ce_cnt_o),
+        |      .ft_dmr_cnt_o(ft_dmr_cnt_o)
         |""".stripMargin.replaceAll("GENN", instructionLanes.toString)
     coreInstantiation += "  );\n"
 
@@ -528,6 +538,11 @@ class RvvCoreWrapper(p: Parameters)
     val rvv_idle    = Output(Bool())
 
     val queue_capacity = Output(UInt(4.W))
+
+    // Fault-tolerance event counters. Always present, tied to 0 inside
+    // RvvCore.sv when the fault-tolerant back end is compiled out.
+    val ft_ce_cnt_o  = Output(UInt(32.W))
+    val ft_dmr_cnt_o = Output(UInt(32.W))
   })
   dontTouch(io.rd_rob2rt_o)
 
@@ -788,4 +803,7 @@ class RvvCoreShim(p: Parameters) extends Module {
   io.csr.vstart := vstart
   io.csr.vxrm   := vxrm
   io.csr.vxsat  := vxsat
+  // Straight through from the back end; nothing here reads them.
+  io.csr.ft_ce_cnt  := rvvCoreWrapper.io.ft_ce_cnt_o
+  io.csr.ft_dmr_cnt := rvvCoreWrapper.io.ft_dmr_cnt_o
 }

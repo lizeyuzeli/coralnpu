@@ -767,6 +767,14 @@ class DispatchV2(p: Parameters) extends Dispatch(p) {
       // mtype (0xC23) until the vector unit is idle. These CSRs can be
       // modified by in-flight vector instructions: saturating arithmetic sets
       // vxsat (vcsr contains vxsat as a bitfield); mset* updates mtype.
+      // The fault-tolerance counters (0x7C9/0x7CA) are deliberately NOT here,
+      // even though an in-flight vector instruction can bump them too. They are
+      // diagnostic, and for a diagnostic register being readable when the
+      // machine is broken outranks being current: rvv_idle never rises while
+      // the vector unit is hung, so a stalled read would turn a vector-unit
+      // hang into a whole-core hang and deny a post-mortem handler the one
+      // piece of evidence it came for. The freshness that buys is worth little,
+      // since a lifetime total is read at a quiescent point anyway.
       val isVxsatOrVcsr = csr_bits_index === 0x009.U || csr_bits_index === 0x00f.U ||
         (if (p.enableVme) { csr_bits_index === 0xc23.U }
          else { false.B })

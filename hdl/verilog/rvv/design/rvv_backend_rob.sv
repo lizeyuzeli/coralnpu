@@ -42,7 +42,9 @@ module rvv_backend_rob
     ,
     reinject_freeslot_dp2rob,   // in : per-unit per-port free RS push slot mask this cycle
     reinject_valid_rob2dp,      // out: per-unit per-port replay request
-    reinject_entry_rob2dp       // out: per-unit per-port physical ROB entry to replay
+    reinject_entry_rob2dp,      // out: per-unit per-port physical ROB entry to replay
+    ft_ce_cnt_rob2rvs,          // out: TMR corrections, for the scalar CSR
+    ft_dmr_cnt_rob2rvs          // out: DMR rollbacks, for the scalar CSR
 `endif
 );
 // global signal
@@ -87,6 +89,14 @@ module rvv_backend_rob
     input   logic [3:0][`NUM_DP_UOP-1:0]                   reinject_freeslot_dp2rob; // [unit][port] 1=free
     output  logic [3:0][`NUM_DP_UOP-1:0]                   reinject_valid_rob2dp;    // [unit][port] 1=replay this port
     output  logic [3:0][`NUM_DP_UOP-1:0][`ROB_DEPTH_WIDTH-1:0] reinject_entry_rob2dp; // [unit][port] physical entry
+
+// fault-tolerance event counters, read back through CSRs (ftcecnt/ftdmrcnt).
+// Purely observational: nothing in the design reads them, so a fault in the
+// counters cannot change execution -- which is why they are not themselves
+// hardened. They exist so that "the run passed" can be told apart from "the run
+// passed and nothing was ever wrong".
+    output  logic [`FT_CE_CNT_W-1:0]                       ft_ce_cnt_rob2rvs;
+    output  logic [`FT_CE_CNT_W-1:0]                       ft_dmr_cnt_rob2rvs;
 `endif
 
 // ---internal signal definition--------------------------------------
@@ -178,6 +188,17 @@ module rvv_backend_rob
     logic                                              ft_tmr_disagree_q;
     logic [`FT_TMR_COPIES-1:0][`ROB_DEPTH-1:0]         ft_ce_entry_valid;  // what u_vote_entry_valid actually reads
     `FT_KEEP logic [`FT_CE_CNT_W-1:0]                  ft_ce_cnt;          // saturating CE event count
+  // ---- DMR rollback counter -------------------------------------------
+  // The same argument one level up: retries that succeed leave no trace, so a
+  // run where DMR caught and repaired ten errors and a run where nothing ever
+  // went wrong are the same clean pass. ftstatus.ERR only reports the retries
+  // that ran out; this counts the ones that worked, which is the whole point of
+  // the time redundancy. Separate from ft_ce_cnt because they measure different
+  // mechanisms -- TMR corrections in the ROB's own control state vs. DMR
+  // corrections of the datapath result -- and a design decision that trades one
+  // for the other needs to see them apart.
+    `FT_KEEP logic [`FT_CE_CNT_W-1:0]                  ft_dmr_cnt;         // saturating DMR rollback count
+    logic [`FT_CE_CNT_W:0]                             ft_dmr_cnt_next;    // one extra bit: carry out = saturate
 `ifdef FT_INJECT_ON
   // self-test: force a one-time mismatch per FT entry to exercise the
   // duplicate->compare->rollback->retry->recover chain (see config.svh).
@@ -990,6 +1011,32 @@ module rvv_backend_rob
                 ft_ce_cnt <= ft_ce_cnt + 1'b1;
         end
     end
+
+  // ft_rollback is a one-cycle pulse per mismatch (it is what advances
+  // retry_cnt), and up to ROB_DEPTH entries can mismatch in the same cycle, so
+  // the increment is a population count, not a +1. The final, budget-exhausting
+  // mismatch is counted too: it is still a detection, it just was not repaired,
+  // and ftstatus.ERR is what separates the two. Never cleared by
+  // trap_flush_rvv -- the point of the number is to survive the recovery it is
+  // measuring; only reset clears it.
+    always_comb begin
+        ft_dmr_cnt_next = {1'b0, ft_dmr_cnt};
+        for (int i = 0; i < `ROB_DEPTH; i++)
+            if (ft_rollback[i])
+                ft_dmr_cnt_next = ft_dmr_cnt_next + 1'b1;
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            ft_dmr_cnt <= '0;
+        else if (ft_dmr_cnt_next[`FT_CE_CNT_W])   // carry out of the count width
+            ft_dmr_cnt <= {`FT_CE_CNT_W{1'b1}};   // saturate: report "at least this many"
+        else
+            ft_dmr_cnt <= ft_dmr_cnt_next[`FT_CE_CNT_W-1:0];
+    end
+
+  assign ft_ce_cnt_rob2rvs  = ft_ce_cnt;
+  assign ft_dmr_cnt_rob2rvs = ft_dmr_cnt;
 
   // ---- DMR multi-issue reinject arbiter (combinational) ---------------
   // Walk entries in PROGRAM order (oldest first). For each owed copy, find a

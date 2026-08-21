@@ -33,6 +33,11 @@ class CsrRvvIO(p: Parameters) extends Bundle {
   // cycles later and by then the pulse is long gone. Always present in the
   // interface, and always 0 in a build without the fault-tolerant back end.
   val ft_error = Input(Bool())
+  // Saturating lifetime counts of errors the vector unit CORRECTED, as opposed
+  // to ft_error, which reports the one it could not. Read-only; the back end
+  // owns them and only reset clears them.
+  val ft_ce_cnt  = Input(UInt(p.xlen.W))
+  val ft_dmr_cnt = Input(UInt(p.xlen.W))
   // From Csr to RvvCore
   val vstart_write = Output(Valid(UInt(log2Ceil(p.rvvVlen).W)))
   val vxrm_write   = Output(Valid(UInt(2.W)))
@@ -84,6 +89,9 @@ object CsrAddress extends ChiselEnum {
   val MCONTEXT7 = Value(0x7c7.U(12.W))
   // Custom machine RW. Vector-unit fault-tolerance status; see ftstatus below.
   val FTSTATUS  = Value(0x7c8.U(12.W))
+  // Custom machine RO. Corrected-error counts; see the read mux below.
+  val FTCECNT   = Value(0x7c9.U(12.W))
+  val FTDMRCNT  = Value(0x7ca.U(12.W))
   val MPC       = Value(0x7e0.U(12.W))
   val MSP       = Value(0x7e1.U(12.W))
   val MCYCLE    = Value(0xb00.U(12.W))
@@ -405,6 +413,8 @@ class Csr(p: Parameters) extends Module {
   val mcontext6En = csr_address === CsrAddress.MCONTEXT6
   val mcontext7En = csr_address === CsrAddress.MCONTEXT7
   val ftstatusEn  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTSTATUS }
+  val ftcecntEn   = Option.when(p.enableRvv) { csr_address === CsrAddress.FTCECNT }
+  val ftdmrcntEn  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTDMRCNT }
   val mpcEn       = csr_address === CsrAddress.MPC
   val mspEn       = csr_address === CsrAddress.MSP
   // M-mode performance CSRs.
@@ -525,7 +535,13 @@ class Csr(p: Parameters) extends Module {
             vxrmEn.get     -> io.rvv.get.vxrm,
             vxsatEn.get    -> io.rvv.get.vxsat,
             vlenbEn.get    -> 16.U(32.W), // Vector length in Bytes
-            ftstatusEn.get -> ftstatus.get
+            ftstatusEn.get -> ftstatus.get,
+            // Read-only on purpose: these are evidence, and evidence software
+            // can rewrite is worth less than evidence it cannot. Writes are
+            // ignored rather than trapped, matching how the rest of this file
+            // treats a write to a read-only counter.
+            ftcecntEn.get  -> io.rvv.get.ft_ce_cnt,
+            ftdmrcntEn.get -> io.rvv.get.ft_dmr_cnt
           )
         }
         .getOrElse(Seq())

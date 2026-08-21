@@ -36,6 +36,15 @@
 // vector unit failed. Both halves are checked here: that the bit is set on
 // arrival, and that software can clear it, since a bit that cannot be cleared
 // reports every future error as already-known.
+//
+// Finally it reads the two event counters, ftdmrcnt (0x7ca) and ftcecnt (0x7c9).
+// These are the other half of the picture, and the more interesting half: a
+// retry that succeeds is invisible in every other way -- the program computes
+// the right answer and nothing is reported -- so without a counter, a run in
+// which DMR caught and repaired an error is indistinguishable from a run in
+// which nothing ever went wrong. That distinction is the entire claim the time
+// redundancy makes, so the FT_INJECT_ON build below (inject, recover, no trap)
+// is the case that matters most here, not the trapping one.
 
 #include <riscv_vector.h>
 #include <cstdint>
@@ -54,6 +63,11 @@ volatile uint32_t ft_trap_mepc   = 0xffffffff;
 // ftstatus as read in the handler, and again after the handler cleared it.
 volatile uint32_t ft_trap_status         = 0xffffffff;
 volatile uint32_t ft_trap_status_cleared = 0xffffffff;
+// Corrected-error counts, read on whichever path the program actually takes.
+// Lifetime totals, cleared only by reset, so a single-ELF test is the only place
+// they can be read meaningfully (the harness resets before every program).
+volatile uint32_t ft_ce_cnt  = 0xffffffff;
+volatile uint32_t ft_dmr_cnt = 0xffffffff;
 
 void isr_wrapper(void);
 __attribute__((naked)) void isr_wrapper(void) {
@@ -94,6 +108,17 @@ __attribute__((naked)) void isr_wrapper(void) {
       "la   t2, ft_trap_status_cleared \n"
       "sw   t0, 0(t2) \n"
       "bnez t0, 2f \n"
+      // The trap is the end of a retry sequence, so the DMR counter must have
+      // counted those retries. Zero here would mean the counter is not wired to
+      // the mechanism it claims to measure -- checked as a lower bound only,
+      // since the exact number follows FT_RETRY_MAX and is reported, not fixed.
+      "csrr t0, 0x7c9 \n"
+      "la   t2, ft_ce_cnt \n"
+      "sw   t0, 0(t2) \n"
+      "csrr t0, 0x7ca \n"
+      "la   t2, ft_dmr_cnt \n"
+      "sw   t0, 0(t2) \n"
+      "beqz t0, 2f \n"
       "li   t0, 1 \n"
       "la   t2, ft_trap_observed \n"
       "sw   t0, 0(t2) \n"
@@ -122,6 +147,19 @@ int main(int argc, char** argv) {
   uint32_t status;
   asm volatile("csrr %0, 0x7c8" : "=r"(status));
   ft_trap_status = status;
+  // Reached in three different builds, and the counters are what tells them
+  // apart: 0 with no fault tolerance, 0 with it but nothing injected, and
+  // nonzero when an injected error was corrected and the program still got the
+  // right answer. These reads are not interlocked against the vector unit (see
+  // Decode.scala for why), so in principle they could miss a rollback that has
+  // not happened yet; here they do not, because the injected mismatch is
+  // detected within a few cycles of the uop entering the ROB, which is shorter
+  // than the distance from this instruction being fetched to its CSR read.
+  uint32_t cecnt, dmrcnt;
+  asm volatile("csrr %0, 0x7c9" : "=r"(cecnt));
+  asm volatile("csrr %0, 0x7ca" : "=r"(dmrcnt));
+  ft_ce_cnt = cecnt;
+  ft_dmr_cnt = dmrcnt;
   ft_trap_observed = 0;
   asm volatile(".word 0x08000073");  // mpause (halt)
   return 0;

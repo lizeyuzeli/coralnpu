@@ -66,6 +66,12 @@ module rvv_backend
     rd_rob2rt_o,
 
     rvv_idle
+
+`ifdef FAULT_TOLERANT_ON
+    ,
+    ft_ce_cnt_rvv2rvs,
+    ft_dmr_cnt_rvv2rvs
+`endif
 );
 // global signal
     input   logic                                 clk;
@@ -136,6 +142,13 @@ module rvv_backend
 
 // rvv_backend is not active.(IDLE)
     output  logic                                 rvv_idle;
+
+`ifdef FAULT_TOLERANT_ON
+// fault-tolerance event counters (see rvv_backend_rob.sv). Saturating, cleared
+// only by reset, read back by software through ftcecnt/ftdmrcnt.
+    output  logic     [`FT_CE_CNT_W-1:0]          ft_ce_cnt_rvv2rvs;
+    output  logic     [`FT_CE_CNT_W-1:0]          ft_dmr_cnt_rvv2rvs;
+`endif
 
 // ---internal signals definition-------------------------------------
   // RVV frontend to command queue
@@ -1344,7 +1357,10 @@ module rvv_backend
         ,
         .reinject_freeslot_dp2rob (reinject_freeslot_dp2rob),
         .reinject_valid_rob2dp    (reinject_valid_rob2dp),
-        .reinject_entry_rob2dp    (reinject_entry_rob2dp)
+        .reinject_entry_rob2dp    (reinject_entry_rob2dp),
+      // FT event counters, out to the scalar CSR
+        .ft_ce_cnt_rob2rvs        (ft_ce_cnt_rvv2rvs),
+        .ft_dmr_cnt_rob2rvs       (ft_dmr_cnt_rvv2rvs)
       `endif
     );
 

@@ -360,7 +360,9 @@ async def rvv_ft_trap_test(dut):
     took and this test logs it rather than asserting a value it cannot know.
     A silent pass here
     means "no regression"; a pass with ft_trap_observed == 1 means the reporting
-    path was actually exercised.
+    path was actually exercised. The logged ftdmrcnt/ftcecnt are what make the
+    middle case visible: an injected error that retry corrected leaves no other
+    trace, since the program computes the right answer and reports nothing.
     """
     if "Rvv" not in dut._name:
         dut._log.info("Skipping rvv_ft_trap_test on non-RVV core")
@@ -378,6 +380,8 @@ async def rvv_ft_trap_test(dut):
             "ft_trap_mepc",
             "ft_trap_status",
             "ft_trap_status_cleared",
+            "ft_ce_cnt",
+            "ft_dmr_cnt",
         ],
     )
     await fixture.run_to_halt(timeout_cycles=50000)
@@ -388,24 +392,41 @@ async def rvv_ft_trap_test(dut):
 
     observed = await read_u32("ft_trap_observed")
     status = await read_u32("ft_trap_status")
+    ce_cnt = await read_u32("ft_ce_cnt")
+    dmr_cnt = await read_u32("ft_dmr_cnt")
     if observed == 1:
         mcause = await read_u32("ft_trap_mcause")
         mepc = await read_u32("ft_trap_mepc")
         vstart = await read_u32("ft_trap_vstart")
         cleared = await read_u32("ft_trap_status_cleared")
+        # Build-independent lower bound: the trap is what a retry sequence ends
+        # in, so at least one rollback must have been counted. No upper bound --
+        # that follows FT_RETRY_MAX, which the build is free to change.
+        assert dmr_cnt >= 1, (
+            f"trap delivered but ftdmrcnt is {dmr_cnt}: the counter is not "
+            "connected to the rollbacks that caused the trap"
+        )
         dut._log.info(
             "FT trap reported: mcause=%d mepc=0x%08x vstart=%d ftstatus=0x%08x "
-            "after clear=0x%08x" % (mcause, mepc, vstart, status, cleared)
+            "after clear=0x%08x ftdmrcnt=%d ftcecnt=%d"
+            % (mcause, mepc, vstart, status, cleared, dmr_cnt, ce_cnt)
         )
     else:
         # Build-independent: no error means no error bit. Asserted rather than
         # logged because a ftstatus stuck at 1 would otherwise pass every build
         # -- it would satisfy the trapping case above for the wrong reason.
         assert status == 0, f"ftstatus set without an FT error: 0x{status:08x}"
+        # The counters are NOT asserted to be zero here. This branch covers both
+        # "nothing went wrong" and "an injected error was corrected by retry and
+        # the program went on to finish" -- the second is the case the time
+        # redundancy exists for, and it is only visible as a nonzero count on an
+        # otherwise clean run. Which one happened is a property of the build, so
+        # it is reported.
         dut._log.info(
             "No FT trap in this build (FAULT_TOLERANT_ON/FT_INJECT_ON/"
-            "FT_INJECT_PERSIST not all set); ftstatus clean, checked for no "
-            "regression only"
+            "FT_INJECT_PERSIST not all set); ftstatus clean, "
+            "ftdmrcnt=%d ftcecnt=%d (nonzero = errors corrected without any "
+            "software-visible effect)" % (dmr_cnt, ce_cnt)
         )
 
 

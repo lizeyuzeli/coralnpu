@@ -99,7 +99,16 @@ module RvvCore #(parameter N = 4,
 
   // VXSAT update from backend (fixes C3 bug: previously dead-end wires)
   output logic                            wr_vxsat_valid_o,
-  output logic    [`VCSR_VXSAT_WIDTH-1:0] wr_vxsat_o
+  output logic    [`VCSR_VXSAT_WIDTH-1:0] wr_vxsat_o,
+
+  // Fault-tolerance event counters, read back through ftcecnt/ftdmrcnt.
+  // Present in every build and zero when the back end has no counters, so that
+  // FAULT_TOLERANT_ON stays a property of the vector back end and does not
+  // reach into the scalar core's port list or its CSR file (INV-1). Widened to
+  // xlen here rather than at the CSR, so the Chisel side never has to know
+  // FT_CE_CNT_W.
+  output logic [31:0] ft_ce_cnt_o,
+  output logic [31:0] ft_dmr_cnt_o
 );
   logic [N-1:0] frontend_cmd_valid;
   RVVCmd [N-1:0] frontend_cmd_data;
@@ -217,6 +226,11 @@ module RvvCore #(parameter N = 4,
   logic                            wr_vxsat_valid;
   logic    [`VCSR_VXSAT_WIDTH-1:0] wr_vxsat;
 
+`ifdef FAULT_TOLERANT_ON
+  logic    [`FT_CE_CNT_W-1:0]      ft_ce_cnt_int;
+  logic    [`FT_CE_CNT_W-1:0]      ft_dmr_cnt_int;
+`endif
+
   // Floating point CSR Update, unused for now
   logic    rt2fcsr_write_valid;
   RVFEXP_t rt2fcsr_write_data;
@@ -288,6 +302,10 @@ module RvvCore #(parameter N = 4,
       .rd_valid_rob2rt_o(rd_valid_rob2rt_o),
       .rvv_idle(rvv_backend_idle),
       .rd_rob2rt_o(rd_rob2rt_o)
+`ifdef FAULT_TOLERANT_ON
+      ,.ft_ce_cnt_rvv2rvs(ft_ce_cnt_int),
+      .ft_dmr_cnt_rvv2rvs(ft_dmr_cnt_int)
+`endif
 `ifdef ZVT_ON
       ,.uop_vme2lsu_vld(uop_vme2lsu_vld_dummy),
       .uop_vme2lsu(uop_vme2lsu_dummy),
@@ -301,5 +319,16 @@ module RvvCore #(parameter N = 4,
   // Connect vxsat signals to outputs (fixes C3 bug)
   assign wr_vxsat_valid_o = wr_vxsat_valid;
   assign wr_vxsat_o = wr_vxsat;
+
+  // Zero in a non-FT build, and the CSRs read 0. Distinguishable from a broken
+  // FT build only in combination with ftstatus and the directed test, which is
+  // why the test asserts the pair (see rvv_ft_trap.cc).
+`ifdef FAULT_TOLERANT_ON
+  assign ft_ce_cnt_o  = {{(32-`FT_CE_CNT_W){1'b0}}, ft_ce_cnt_int};
+  assign ft_dmr_cnt_o = {{(32-`FT_CE_CNT_W){1'b0}}, ft_dmr_cnt_int};
+`else
+  assign ft_ce_cnt_o  = 32'b0;
+  assign ft_dmr_cnt_o = 32'b0;
+`endif
 
 endmodule

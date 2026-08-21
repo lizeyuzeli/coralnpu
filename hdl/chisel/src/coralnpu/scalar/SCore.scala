@@ -543,6 +543,10 @@ class SCore(p: Parameters) extends Module {
     csr.io.rvv.get.vtype   := io.rvvcore.get.configState.bits.vtype
     csr.io.rvv.get.vxrm    := io.rvvcore.get.csr.vxrm
     csr.io.rvv.get.vxsat   := io.rvvcore.get.csr.vxsat
+    // Unlike ft_error, these come from the vector core's own port -- they are a
+    // running total the back end keeps, not a retire-stage decision made here.
+    csr.io.rvv.get.ft_ce_cnt  := io.rvvcore.get.csr.ft_ce_cnt
+    csr.io.rvv.get.ft_dmr_cnt := io.rvvcore.get.csr.ft_dmr_cnt
     if (p.enableVme) {
       csr.io.rvv.get.mtype := io.rvvcore.get.configState.bits.mtype.get
     } else {

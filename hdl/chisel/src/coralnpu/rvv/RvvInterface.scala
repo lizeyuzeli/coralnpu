@@ -120,4 +120,8 @@ class RvvCsrIO(p: Parameters) extends Bundle {
   val vstart_write = Input(Valid(UInt(log2Ceil(p.rvvVlen).W)))
   val vxrm_write   = Input(Valid(UInt(2.W)))
   val vxsat_write  = Input(Valid(Bool()))
+  // Fault-tolerance event counters, read back through ftcecnt/ftdmrcnt. Zero in
+  // a build without the fault-tolerant back end.
+  val ft_ce_cnt  = Output(UInt(32.W))
+  val ft_dmr_cnt = Output(UInt(32.W))
 }
