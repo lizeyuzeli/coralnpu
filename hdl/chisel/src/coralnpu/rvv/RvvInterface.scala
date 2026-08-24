@@ -124,4 +124,9 @@ class RvvCsrIO(p: Parameters) extends Bundle {
   // a build without the fault-tolerant back end.
   val ft_ce_cnt  = Output(UInt(32.W))
   val ft_dmr_cnt = Output(UInt(32.W))
+  // Constant 1 when this build has the fault-tolerant back end, so that ftctl
+  // can report whether its enable bit is attached to anything.
+  val ft_present = Output(Bool())
+  // ftctl bit 0: run-time enable for instruction duplication.
+  val ft_en      = Input(Bool())
 }

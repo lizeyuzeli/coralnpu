@@ -547,6 +547,8 @@ class SCore(p: Parameters) extends Module {
     // running total the back end keeps, not a retire-stage decision made here.
     csr.io.rvv.get.ft_ce_cnt  := io.rvvcore.get.csr.ft_ce_cnt
     csr.io.rvv.get.ft_dmr_cnt := io.rvvcore.get.csr.ft_dmr_cnt
+    csr.io.rvv.get.ft_present := io.rvvcore.get.csr.ft_present
+    io.rvvcore.get.csr.ft_en  := csr.io.rvv.get.ft_en
     if (p.enableVme) {
       csr.io.rvv.get.mtype := io.rvvcore.get.configState.bits.mtype.get
     } else {

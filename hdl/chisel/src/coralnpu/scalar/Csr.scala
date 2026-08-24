@@ -38,11 +38,19 @@ class CsrRvvIO(p: Parameters) extends Bundle {
   // owns them and only reset clears them.
   val ft_ce_cnt  = Input(UInt(p.xlen.W))
   val ft_dmr_cnt = Input(UInt(p.xlen.W))
+  // Constant 1 when the vector back end was built fault-tolerant. Makes ftctl
+  // self-describing: a write that reads back as 0 means there is no FT logic to
+  // enable, which software cannot otherwise tell from FT being merely off.
+  val ft_present = Input(Bool())
   // From Csr to RvvCore
   val vstart_write = Output(Valid(UInt(log2Ceil(p.rvvVlen).W)))
   val vxrm_write   = Output(Valid(UInt(2.W)))
   val vxsat_write  = Output(Valid(Bool()))
   val frm          = Output(UInt(3.W))
+  // ftctl bit 0: run-time enable for the vector unit's instruction duplication.
+  // Sampled at dispatch with no interlock -- see rvv_backend_dispatch.sv for why
+  // an in-flight uop needs none.
+  val ft_en        = Output(Bool())
 }
 
 object Csr {
@@ -92,6 +100,8 @@ object CsrAddress extends ChiselEnum {
   // Custom machine RO. Corrected-error counts; see the read mux below.
   val FTCECNT   = Value(0x7c9.U(12.W))
   val FTDMRCNT  = Value(0x7ca.U(12.W))
+  // Custom machine RW. Vector-unit fault-tolerance control; see ftctl below.
+  val FTCTL     = Value(0x7cb.U(12.W))
   val MPC       = Value(0x7e0.U(12.W))
   val MSP       = Value(0x7e1.U(12.W))
   val MCYCLE    = Value(0xb00.U(12.W))
@@ -344,6 +354,23 @@ class Csr(p: Parameters) extends Module {
   // read writes the value back unchanged.
   val ftstatus = Option.when(p.enableRvv) { RegInit(0.U(p.xlen.W)) }
 
+  // Vector-unit fault-tolerance control.
+  //   bit 0  EN       enable instruction duplication (DMR) in the vector unit
+  //   bit 1  PRESENT  read-only, 1 if this build has the fault-tolerant back end
+  //   31:2            reserved, read as zero
+  // Resets to enabled: a machine that boots with its fault tolerance switched
+  // off protects nothing until software remembers to ask, and forgetting to ask
+  // is silent. Software turns it off deliberately, to buy back the power and the
+  // issue slots duplication costs.
+  //
+  // PRESENT is here rather than in a separate register because the question it
+  // answers -- "is there anything behind bit 0?" -- only ever comes up when
+  // software touches bit 0. It is read-only and derived, so only EN is stored.
+  // In a build without the FT back end the read value is 0 in full, EN included:
+  // "wrote 1, read back 0" then means there is no FT logic, and reporting EN=1
+  // there would describe the register rather than the machine.
+  val ftctlEn = Option.when(p.enableRvv) { RegInit(true.B) }
+
   val mcycle                    = RegInit(0.U(64.W))
   val minstret                  = RegInit(0.U(64.W))
   val minstretThisCycle_delayed = Wire(UInt(64.W))
@@ -415,6 +442,7 @@ class Csr(p: Parameters) extends Module {
   val ftstatusEn  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTSTATUS }
   val ftcecntEn   = Option.when(p.enableRvv) { csr_address === CsrAddress.FTCECNT }
   val ftdmrcntEn  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTDMRCNT }
+  val ftctlEnSel  = Option.when(p.enableRvv) { csr_address === CsrAddress.FTCTL }
   val mpcEn       = csr_address === CsrAddress.MPC
   val mspEn       = csr_address === CsrAddress.MSP
   // M-mode performance CSRs.
@@ -541,7 +569,14 @@ class Csr(p: Parameters) extends Module {
             // ignored rather than trapped, matching how the rest of this file
             // treats a write to a read-only counter.
             ftcecntEn.get  -> io.rvv.get.ft_ce_cnt,
-            ftdmrcntEn.get -> io.rvv.get.ft_dmr_cnt
+            ftdmrcntEn.get -> io.rvv.get.ft_dmr_cnt,
+            // Whole register reads 0 without the FT back end, EN included, so
+            // that a read reports the machine and not the register file.
+            ftctlEnSel.get -> Mux(
+              io.rvv.get.ft_present,
+              Cat(0.U((p.xlen - 2).W), 1.U(1.W), ftctlEn.get),
+              0.U(p.xlen.W)
+            )
           )
         }
         .getOrElse(Seq())
@@ -622,6 +657,13 @@ class Csr(p: Parameters) extends Module {
     // the first -- would read back as clean.
     val ftstatusWritten = Mux(req.valid && ftstatusEn.get, wdata, ftstatus.get)
     ftstatus.get := ftstatusWritten | Cat(0.U((p.xlen - 1).W), io.rvv.get.ft_error)
+
+    // ftctl bit 0. Bits 31:1 of the write are ignored, so PRESENT stays read-only
+    // and the reserved bits cannot be made to read back non-zero.
+    when(req.valid && ftctlEnSel.get) { ftctlEn.get := wdata(0) }
+    // Forced low without the FT back end, matching the read value: nothing should
+    // observe an enable that has no logic behind it.
+    io.rvv.get.ft_en := ftctlEn.get && io.rvv.get.ft_present
   }
 
   // mcycle implementation

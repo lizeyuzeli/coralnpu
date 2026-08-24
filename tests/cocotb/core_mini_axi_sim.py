@@ -382,6 +382,9 @@ async def rvv_ft_trap_test(dut):
             "ft_trap_status_cleared",
             "ft_ce_cnt",
             "ft_dmr_cnt",
+            "ft_ctl_reset",
+            "ft_ctl_cleared",
+            "ft_disabled_ran",
         ],
     )
     await fixture.run_to_halt(timeout_cycles=50000)
@@ -394,6 +397,38 @@ async def rvv_ft_trap_test(dut):
     status = await read_u32("ft_trap_status")
     ce_cnt = await read_u32("ft_ce_cnt")
     dmr_cnt = await read_u32("ft_dmr_cnt")
+
+    # ftctl. PRESENT (bit 1) says whether this build has the FT back end, so it
+    # is what decides which assertions apply -- taken from the register itself
+    # rather than from a build flag the test cannot see.
+    ctl_reset = await read_u32("ft_ctl_reset")
+    ctl_cleared = await read_u32("ft_ctl_cleared")
+    disabled_ran = await read_u32("ft_disabled_ran")
+    ft_present = bool(ctl_reset & 0b10)
+    if ft_present:
+        # EN must reset set: fault tolerance that boots off is fault tolerance
+        # nobody turned on.
+        assert ctl_reset & 1, f"ftctl.EN clear at reset: 0x{ctl_reset:08x}"
+        # And the write must stick, or the enable is decorative. PRESENT must
+        # survive it, since a read-only bit cleared by a write to another field
+        # would make the register unable to describe itself.
+        assert ctl_cleared == 0b10, (
+            f"ftctl after clearing EN is 0x{ctl_cleared:08x}, expected 0x2 "
+            "(EN clear, PRESENT still set)"
+        )
+    else:
+        # No FT back end: the whole register reads zero, so software is told
+        # there is nothing behind the enable rather than being handed a control
+        # that appears to work and does nothing.
+        assert ctl_reset == 0, (
+            f"ftctl reads 0x{ctl_reset:08x} in a build without FT; expected 0"
+        )
+    # Reached in every build: with FT off, or with FT on but nothing injected,
+    # the instruction simply completes.
+    assert disabled_ran == 1, (
+        "the vector instruction executed with ftctl.EN clear did not complete"
+    )
+
     if observed == 1:
         mcause = await read_u32("ft_trap_mcause")
         mepc = await read_u32("ft_trap_mepc")
@@ -406,10 +441,22 @@ async def rvv_ft_trap_test(dut):
             f"trap delivered but ftdmrcnt is {dmr_cnt}: the counter is not "
             "connected to the rollbacks that caused the trap"
         )
+        # This is the sharp case for ftctl, and the only one that separates
+        # "EN reaches dispatch" from "EN is a register nobody reads": injection
+        # is persistent, so the identical instruction traps below with EN set,
+        # yet completed above with EN clear. Had the write not reached the
+        # duplication logic, the earlier instruction would have trapped too and
+        # this test would have stopped there.
+        assert disabled_ran == 1, (
+            "the instruction ran with EN set traps, but the one run with EN "
+            "clear did not complete: ftctl.EN is not reaching dispatch"
+        )
         dut._log.info(
             "FT trap reported: mcause=%d mepc=0x%08x vstart=%d ftstatus=0x%08x "
-            "after clear=0x%08x ftdmrcnt=%d ftcecnt=%d"
-            % (mcause, mepc, vstart, status, cleared, dmr_cnt, ce_cnt)
+            "after clear=0x%08x ftdmrcnt=%d ftcecnt=%d; ftctl reset=0x%08x "
+            "EN-clear=0x%08x and the instruction run with FT off did not trap"
+            % (mcause, mepc, vstart, status, cleared, dmr_cnt, ce_cnt,
+               ctl_reset, ctl_cleared)
         )
     else:
         # Build-independent: no error means no error bit. Asserted rather than

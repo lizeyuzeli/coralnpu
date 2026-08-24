@@ -55,6 +55,9 @@ module rvv_backend_dispatch
     rd_index_dp2vrf,        
     rd_data_vrf2dp,
     v0_mask_vrf2dp,
+`ifdef FAULT_TOLERANT_ON
+    ft_en_rvs2dp,
+`endif
     rob_entry
 );  
 // ---port definition-------------------------------------------------
@@ -125,6 +128,23 @@ module rvv_backend_dispatch
     output logic [`NUM_DP_VRF-1:0][`REGFILE_INDEX_WIDTH-1:0] rd_index_dp2vrf;          
     input  logic [`NUM_DP_VRF-1:0][`VLEN-1:0]                rd_data_vrf2dp;
     input  logic [`VLEN-1:0]                                 v0_mask_vrf2dp;
+
+`ifdef FAULT_TOLERANT_ON
+// Run-time fault-tolerance enable, from the scalar core's ftctl CSR. Gates the
+// is_ft whitelist below, so software can turn duplication off for the power and
+// throughput it costs and back on for the coverage it buys.
+//
+// Deliberately unsynchronised: no RAW-hazard interlock, unlike frm. frm changes
+// what a uop computes, so a stale value is a wrong answer; ft_en only changes
+// whether a uop is computed twice, and both paths produce the same architectural
+// result. So the few uops already in flight when software writes ftctl finish
+// under the old setting, which costs nothing and is indistinguishable from the
+// command queue's normal scalar/vector skew. It is sampled at dispatch and
+// travels with the entry in is_ft, so an in-flight FT entry keeps its two-copy
+// semantics all the way through compare and rollback -- turning FT off never
+// strands an entry waiting for a second copy that will not come.
+    input  logic                                             ft_en_rvs2dp;
+`endif
 
 // Dispatch unit accept all ROB entry to determine if vs_data of RS is from ROB or not
 // ROB unit to Dispatch unit
@@ -558,10 +578,12 @@ module rvv_backend_dispatch
           // these new EXE_UNIT_e values are excluded automatically.
           // ft_unit selects the replay target RS: 0=ALU, 1=MUL/MAC, 2=DIV, 3=FALU.
           // FDIV shares the DIV RS (DIV_RS_t payload) so it maps to unit 2.
-          // ft_global_en is the run-time CSR enable; tied to 1 in Stage 1/2 (the
-          // FAULT_TOLERANT_ON compile switch already gates all FT logic), wired
-          // to the CSR in Stage 3.
-            assign uop_dp2rob[i].is_ft          = 1'b1 &
+          // ft_en_rvs2dp is the run-time CSR enable (ftctl bit 0), and it gates
+          // only is_ft: an entry dispatched while FT was on stays a two-copy
+          // entry, so disabling FT can never strand one waiting for a copy-2
+          // that will not be sent. ft_unit is left ungated -- it is meaningless
+          // when is_ft is 0 and gating it would only add logic.
+            assign uop_dp2rob[i].is_ft          = ft_en_rvs2dp &
                                                   ((uop_uop2dp[i].uop_exe_unit == ALU) ||
                                                    (uop_uop2dp[i].uop_exe_unit == MUL) ||
                                                    (uop_uop2dp[i].uop_exe_unit == MAC) ||

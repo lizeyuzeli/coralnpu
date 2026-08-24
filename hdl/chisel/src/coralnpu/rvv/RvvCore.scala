@@ -178,7 +178,10 @@ object GenerateCoreShimSource {
     // generated once and has to match RvvCore.sv, which ties both to 0 when the
     // fault-tolerant back end is compiled out. That is what keeps
     // FAULT_TOLERANT_ON a property of the vector back end alone (INV-1).
+    // ft_en_i and ft_present_o are unconditional for the same reason.
     moduleInterface += """
+        |    input ft_en_i,
+        |    output ft_present_o,
         |    output [31:0] ft_ce_cnt_o,
         |    output [31:0] ft_dmr_cnt_o,""".stripMargin
 
@@ -367,6 +370,8 @@ object GenerateCoreShimSource {
         |      .trap_data_o(trap_data),
         |      .wr_vxsat_valid_o(wr_vxsat_valid_o),
         |      .wr_vxsat_o(wr_vxsat_o),
+        |      .ft_en_i(ft_en_i),
+        |      .ft_present_o(ft_present_o),
         |      .ft_ce_cnt_o(ft_ce_cnt_o),
         |      .ft_dmr_cnt_o(ft_dmr_cnt_o)
         |""".stripMargin.replaceAll("GENN", instructionLanes.toString)
@@ -543,6 +548,8 @@ class RvvCoreWrapper(p: Parameters)
     // RvvCore.sv when the fault-tolerant back end is compiled out.
     val ft_ce_cnt_o  = Output(UInt(32.W))
     val ft_dmr_cnt_o = Output(UInt(32.W))
+    val ft_en_i      = Input(Bool())
+    val ft_present_o = Output(Bool())
   })
   dontTouch(io.rd_rob2rt_o)
 
@@ -806,4 +813,6 @@ class RvvCoreShim(p: Parameters) extends Module {
   // Straight through from the back end; nothing here reads them.
   io.csr.ft_ce_cnt  := rvvCoreWrapper.io.ft_ce_cnt_o
   io.csr.ft_dmr_cnt := rvvCoreWrapper.io.ft_dmr_cnt_o
+  io.csr.ft_present := rvvCoreWrapper.io.ft_present_o
+  rvvCoreWrapper.io.ft_en_i := io.csr.ft_en
 }

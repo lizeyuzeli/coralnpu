@@ -69,6 +69,7 @@ module rvv_backend
 
 `ifdef FAULT_TOLERANT_ON
     ,
+    ft_en_rvs2rvv,
     ft_ce_cnt_rvv2rvs,
     ft_dmr_cnt_rvv2rvs
 `endif
@@ -144,6 +145,11 @@ module rvv_backend
     output  logic                                 rvv_idle;
 
 `ifdef FAULT_TOLERANT_ON
+// Run-time fault-tolerance enable, from the scalar core's ftctl CSR (bit 0).
+// Goes to dispatch, which samples it into is_ft; see rvv_backend_dispatch.sv for
+// why it needs no interlock against in-flight uops.
+    input   logic                                 ft_en_rvs2rvv;
+
 // fault-tolerance event counters (see rvv_backend_rob.sv). Saturating, cleared
 // only by reset, read back by software through ftcecnt/ftdmrcnt.
     output  logic     [`FT_CE_CNT_W-1:0]          ft_ce_cnt_rvv2rvs;
@@ -611,6 +617,10 @@ module rvv_backend
         .rd_index_dp2vrf      (rd_index_dp2vrf),
         .rd_data_vrf2dp       (rd_data_vrf2dp),
         .v0_mask_vrf2dp       (v0_mask_vrf2dp),
+      `ifdef FAULT_TOLERANT_ON
+      // run-time FT enable (ftctl bit 0)
+        .ft_en_rvs2dp         (ft_en_rvs2rvv),
+      `endif
       // ROB to dispatch
         .rob_entry            (uop_rob2dp)
     );

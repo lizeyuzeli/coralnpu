@@ -37,6 +37,16 @@
 // arrival, and that software can clear it, since a bit that cannot be cleared
 // reports every future error as already-known.
 //
+// It also exercises ftctl (0x7cb), the run-time enable. Duplication costs power
+// and issue slots, so software has to be able to decline it; the register is only
+// worth having if writing it reaches the duplication logic, and a register that
+// merely reads back what was written proves nothing about that. So the check is
+// behavioural, not a read-back: under persistent injection, the same vector
+// instruction that traps with FT enabled must NOT trap with FT disabled, because
+// with no second copy there is no comparison to fail. That is the one experiment
+// that distinguishes "the enable is wired to dispatch" from "the enable is a
+// register nobody reads".
+//
 // Finally it reads the two event counters, ftdmrcnt (0x7ca) and ftcecnt (0x7c9).
 // These are the other half of the picture, and the more interesting half: a
 // retry that succeeds is invisible in every other way -- the program computes
@@ -68,6 +78,15 @@ volatile uint32_t ft_trap_status_cleared = 0xffffffff;
 // they can be read meaningfully (the harness resets before every program).
 volatile uint32_t ft_ce_cnt  = 0xffffffff;
 volatile uint32_t ft_dmr_cnt = 0xffffffff;
+// ftctl as read at reset, and after software wrote 0 to its enable bit.
+// PRESENT (bit 1) is what says whether this build has FT at all, so the whole
+// register reading 0 is a legal answer and not a failure.
+volatile uint32_t ft_ctl_reset   = 0xffffffff;
+volatile uint32_t ft_ctl_cleared = 0xffffffff;
+// 1 if the vector instruction executed with FT disabled completed without
+// trapping. Under persistent injection with FT enabled it would have trapped, so
+// this is the evidence that ftctl.EN reaches dispatch.
+volatile uint32_t ft_disabled_ran = 0;
 
 void isr_wrapper(void);
 __attribute__((naked)) void isr_wrapper(void) {
@@ -131,6 +150,32 @@ __attribute__((naked)) void isr_wrapper(void) {
 
 int main(int argc, char** argv) {
   asm volatile("csrw mtvec, %0" ::"rK"((uint32_t)(&isr_wrapper)));
+
+  // ftctl at reset. EN must come up set: a machine whose fault tolerance boots
+  // off protects nothing until software remembers to ask for it, and forgetting
+  // is silent. Reads 0 in full without the FT back end, which is why the
+  // assertion on this lives in the cocotb driver, where the build is known.
+  uint32_t ctl;
+  asm volatile("csrr %0, 0x7cb" : "=r"(ctl));
+  ft_ctl_reset = ctl;
+
+  // Disable duplication, then run a vector instruction. With FT on and
+  // persistent injection this instruction traps; with FT off there is no second
+  // copy, so there is nothing to compare and nothing to fail. Reaching the store
+  // below is therefore the proof that ftctl.EN reaches dispatch -- if it did not,
+  // this instruction would trap and the ISR would halt the program right here,
+  // leaving ft_disabled_ran at 0.
+  asm volatile("csrci 0x7cb, 1");
+  asm volatile("csrr %0, 0x7cb" : "=r"(ctl));
+  ft_ctl_cleared = ctl;
+  asm volatile(
+      "vsetivli x0, 4, e32, m1, ta, ma \n"
+      "vadd.vi v2, v2, 1 \n");
+  ft_disabled_ran = 1;
+
+  // Re-enable, and from here the program behaves exactly as it did before ftctl
+  // existed: the instruction below traps under persistent injection.
+  asm volatile("csrsi 0x7cb, 1");
 
   // A plain vector arithmetic instruction: nothing about it is illegal, so any
   // exception it takes can only have come from the execution itself.

@@ -101,6 +101,19 @@ module RvvCore #(parameter N = 4,
   output logic                            wr_vxsat_valid_o,
   output logic    [`VCSR_VXSAT_WIDTH-1:0] wr_vxsat_o,
 
+  // Run-time fault-tolerance enable, from ftctl bit 0. Present in every build
+  // and simply ignored when the back end has no FT logic, for the same reason as
+  // the counters below: FAULT_TOLERANT_ON stays a property of the vector back
+  // end. A build without FT reads ftctl back as zero, so software sees "no FT
+  // here" rather than a control that appears to exist and does nothing.
+  input logic ft_en_i,
+
+  // Constant 1 when this build has the fault-tolerant back end. It makes ftctl
+  // self-describing: software reads the register back to discover whether the
+  // control it just wrote is attached to anything, instead of having to know
+  // which bitstream it is running on.
+  output logic ft_present_o,
+
   // Fault-tolerance event counters, read back through ftcecnt/ftdmrcnt.
   // Present in every build and zero when the back end has no counters, so that
   // FAULT_TOLERANT_ON stays a property of the vector back end and does not
@@ -303,7 +316,8 @@ module RvvCore #(parameter N = 4,
       .rvv_idle(rvv_backend_idle),
       .rd_rob2rt_o(rd_rob2rt_o)
 `ifdef FAULT_TOLERANT_ON
-      ,.ft_ce_cnt_rvv2rvs(ft_ce_cnt_int),
+      ,.ft_en_rvs2rvv(ft_en_i),
+      .ft_ce_cnt_rvv2rvs(ft_ce_cnt_int),
       .ft_dmr_cnt_rvv2rvs(ft_dmr_cnt_int)
 `endif
 `ifdef ZVT_ON
@@ -324,9 +338,14 @@ module RvvCore #(parameter N = 4,
   // FT build only in combination with ftstatus and the directed test, which is
   // why the test asserts the pair (see rvv_ft_trap.cc).
 `ifdef FAULT_TOLERANT_ON
+  assign ft_present_o = 1'b1;
   assign ft_ce_cnt_o  = {{(32-`FT_CE_CNT_W){1'b0}}, ft_ce_cnt_int};
   assign ft_dmr_cnt_o = {{(32-`FT_CE_CNT_W){1'b0}}, ft_dmr_cnt_int};
 `else
+  // ft_en_i is accepted and dropped here: the scalar core drives it in every
+  // build so its port list does not depend on FAULT_TOLERANT_ON, and ft_present_o
+  // is how software learns the difference.
+  assign ft_present_o = 1'b0;
   assign ft_ce_cnt_o  = 32'b0;
   assign ft_dmr_cnt_o = 32'b0;
 `endif
