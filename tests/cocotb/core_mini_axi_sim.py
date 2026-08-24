@@ -424,12 +424,37 @@ async def rvv_ft_trap_test(dut):
             f"ftctl reads 0x{ctl_reset:08x} in a build without FT; expected 0"
         )
     # Reached in every build: with FT off, or with FT on but nothing injected,
-    # the instruction simply completes.
-    assert disabled_ran == 1, (
+    # the instruction simply completes. Its value is only *sharp* under
+    # persistent injection, where the same instruction traps with FT enabled --
+    # see the observed == 1 branch. Exempt when observed == 2, because there the
+    # injected tag fault landed on this very instruction and trapped it, which is
+    # a legitimate outcome and not a failure of the enable.
+    assert disabled_ran == 1 or observed == 2, (
         "the vector instruction executed with ftctl.EN clear did not complete"
     )
 
-    if observed == 1:
+    if observed == 2:
+        # Tag-plausibility report (FT_TAG_INJECT_ON). A result was delivered to an
+        # entry that never asked for it; nothing mismatched, so DMR could not have
+        # seen it -- which is the whole reason this check exists separately.
+        # Unrecoverable by construction, so the pass criterion is that it was
+        # detected and reported, not that the program completed.
+        mcause = await read_u32("ft_trap_mcause")
+        mepc = await read_u32("ft_trap_mepc")
+        cleared = await read_u32("ft_trap_status_cleared")
+        assert mcause == 19, f"tag fault reported with mcause {mcause}, expected 19"
+        assert status & 1, (
+            f"tag fault trapped but ftstatus is 0x{status:08x}: the sticky record "
+            "missed an error the trap reported"
+        )
+        assert cleared == 0, f"ftstatus did not clear: 0x{cleared:08x}"
+        dut._log.info(
+            "FT tag fault reported: mcause=%d mepc=0x%08x ftstatus=0x%08x "
+            "after clear=0x%08x ftdmrcnt=%d (0 is correct -- a misdelivered "
+            "result never mismatches, so no rollback happens)"
+            % (mcause, mepc, status, cleared, dmr_cnt)
+        )
+    elif observed == 1:
         mcause = await read_u32("ft_trap_mcause")
         mepc = await read_u32("ft_trap_mepc")
         vstart = await read_u32("ft_trap_vstart")

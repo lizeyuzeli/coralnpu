@@ -132,6 +132,10 @@ module rvv_backend_rob
     logic     [`ROB_DEPTH-1:0][1:0]     reinject_accept;    // copies dispatched this cycle per entry (for pend decrement)
   // retry-exhaustion handoff: K rollbacks reached -> fall back to global trap (INV-5)
     logic     [`ROB_DEPTH-1:0]          ft_trap_req;        // this cycle's rollback would hit FT_RETRY_MAX
+  // P2c tag plausibility (see gen_ft_tag_check). Declared here because the
+  // res_mem write gate above uses it; the logic itself sits with the comparator.
+    logic     [`ROB_DEPTH-1:0]          ft_tag_bad;         // result landed on a free/finished entry
+    logic                               ft_tag_trap_req;    // any implausible tag this cycle
   // ---- TMR of the ROB control state (49 bit) --------------------------
   // Two groups, protected the same way but for different reasons.
   //
@@ -213,8 +217,74 @@ module rvv_backend_rob
   // temp signal
     logic     [`ROB_DEPTH_WIDTH-1:0]    wind_uop_wptr [`ROB_DEPTH-1:0];
     logic     [`ROB_DEPTH_WIDTH-1:0]    wind_uop_rptr [`ROB_DEPTH-1:0];
+// The result bus every FT consumer reads, and the P2c write gate. Both are macros
+// so that with FAULT_TOLERANT_ON off they expand to the bare baseline expression
+// and the res_mem write below is textually unchanged (INV-1). FT_WR_PU2ROB differs
+// from wr_pu2rob only under FT_TAG_INJECT_ON, where one tag is corrupted; routing
+// every consumer through one name is what keeps the injected fault
+// indistinguishable from a real one.
+`ifdef FT_TAG_INJECT_ON
+  `define FT_WR_PU2ROB wr_pu2rob_i
+`else
+  `define FT_WR_PU2ROB wr_pu2rob
+`endif
+`ifdef FAULT_TOLERANT_ON
+  `define FT_WR_GATE(k) && !ft_tag_bad[`FT_WR_PU2ROB[k].rob_entry]
+`else
+  `define FT_WR_GATE(k)
+`endif
+
 `ifdef FAULT_TOLERANT_ON
     localparam int NUM_SMPORT_IDX = (`NUM_SMPORT > 1) ? $clog2(`NUM_SMPORT) : 1;
+
+`ifdef FT_TAG_INJECT_ON
+  // Tag self-test. wr_pu2rob_i is the result bus as the ROB sees it, with one
+  // tag corrupted once per run; every consumer below reads it instead of
+  // wr_pu2rob, so the fault is modelled where it really happens -- in the tag
+  // arriving from the PU -- rather than by lying to the checker alone. Gating
+  // only the checker's input would test nothing: the corrupted result would
+  // still be filed correctly, so a detector that did nothing would look right.
+    PU2ROB_t  [`NUM_SMPORT-1:0]         wr_pu2rob_i;
+    logic                               ft_tag_injected;    // fired once already
+    logic                               ft_tag_inj_fire;    // corrupt a tag this cycle
+    logic     [NUM_SMPORT_IDX-1:0]      ft_tag_inj_port;    // which port gets corrupted
+
+  // Fire on the first cycle a result arrives at all. The low bit of the tag is
+  // flipped, sending the result to entry e^1: an adjacent entry, so the outcome
+  // depends on what that entry is doing, which is exactly the three-way split
+  // the check has to cope with (free / awaiting / finished).
+    always_comb begin
+        ft_tag_inj_fire = 1'b0;
+        ft_tag_inj_port = '0;
+        if (!ft_tag_injected) begin
+            for (int k=`NUM_SMPORT-1; k>=0; k--) begin
+                if (wr_valid_pu2rob[k]) begin
+                    ft_tag_inj_fire = 1'b1;
+                    ft_tag_inj_port = (NUM_SMPORT_IDX)'(k);
+                end
+            end
+        end
+    end
+
+    always_comb begin
+        wr_pu2rob_i = wr_pu2rob;
+        if (ft_tag_inj_fire)
+            wr_pu2rob_i[ft_tag_inj_port].rob_entry =
+                wr_pu2rob[ft_tag_inj_port].rob_entry ^ (`ROB_DEPTH_WIDTH)'(1);
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            ft_tag_injected <= 1'b0;
+        else if (ft_tag_inj_fire) begin
+            ft_tag_injected <= 1'b1;
+            $display("FT: injected tag fault on smport %0d: rob_entry %0d -> %0d",
+                     ft_tag_inj_port, wr_pu2rob[ft_tag_inj_port].rob_entry,
+                     wr_pu2rob_i[ft_tag_inj_port].rob_entry);
+        end
+    end
+`endif
+
 `endif
 
     genvar                              i,j;
@@ -230,6 +300,13 @@ module rvv_backend_rob
   `endif
   `ifndef FAULT_TOLERANT_ON
     initial $fatal(1, "FT_INJECT_PERSIST requires FAULT_TOLERANT_ON");
+  `endif
+`endif
+`ifdef FT_TAG_INJECT_ON
+  // Same reasoning as above: without the circuit it corrupts, this macro is a
+  // no-op that would let "the tag check never fired" pass for evidence.
+  `ifndef FAULT_TOLERANT_ON
+    initial $fatal(1, "FT_TAG_INJECT_ON requires FAULT_TOLERANT_ON");
   `endif
 `endif
 `ifdef FT_TMR_INJECT_ON
@@ -554,15 +631,22 @@ module rvv_backend_rob
             res_mem <= 'b0;
         else begin
             for (int k=0; k<`NUM_SMPORT; k++) begin
-                if (wr_valid_pu2rob[k]) begin
+                // P2c gates the write: without this, a result carrying a corrupt
+                // rob_entry overwrites the target entry's stored result before
+                // anything notices, and the trap would report an error whose
+                // evidence has already been destroyed. Detect and contain in the
+                // same cycle. Both the gate and the tag indirection are macros
+                // that expand to nothing without FAULT_TOLERANT_ON, so the
+                // baseline write is textually identical to before (INV-1).
+                if (wr_valid_pu2rob[k]`FT_WR_GATE(k)) begin
                   `ifdef TB_SUPPORT
-                    res_mem[wr_pu2rob[k].rob_entry].uop_pc    <= wr_pu2rob[k].uop_pc;
+                    res_mem[`FT_WR_PU2ROB[k].rob_entry].uop_pc    <= wr_pu2rob[k].uop_pc;
                   `endif                
-                    res_mem[wr_pu2rob[k].rob_entry].w_valid   <= wr_pu2rob[k].w_valid;
-                    res_mem[wr_pu2rob[k].rob_entry].w_data    <= wr_pu2rob[k].w_data;
-                    res_mem[wr_pu2rob[k].rob_entry].vsaturate <= wr_pu2rob[k].vsaturate;
+                    res_mem[`FT_WR_PU2ROB[k].rob_entry].w_valid   <= wr_pu2rob[k].w_valid;
+                    res_mem[`FT_WR_PU2ROB[k].rob_entry].w_data    <= wr_pu2rob[k].w_data;
+                    res_mem[`FT_WR_PU2ROB[k].rob_entry].vsaturate <= wr_pu2rob[k].vsaturate;
                   `ifdef ZVE32F_ON
-                    res_mem[wr_pu2rob[k].rob_entry].fpexp     <= wr_pu2rob[k].fpexp;
+                    res_mem[`FT_WR_PU2ROB[k].rob_entry].fpexp     <= wr_pu2rob[k].fpexp;
                   `endif
                 end
             end
@@ -640,9 +724,13 @@ module rvv_backend_rob
                     uop_done_tmr[i][wind_uop_rptr[k]] <= 1'b0;
             end
             for (int k=0; k<`NUM_SMPORT; k++) begin
-                if (wr_valid_pu2rob[k])
-                    if (!ft_flag[wr_pu2rob[k].rob_entry])  // FT entries gated by comparator below
-                    uop_done_tmr[i][wr_pu2rob[k].rob_entry] <= 1'b1;
+                // P2c: an implausible tag must not mark its target done either.
+                // Gating res_mem alone would leave the worse half of the failure
+                // intact -- a free entry marked done retires and writes the VRF
+                // from whatever res_mem happens to hold.
+                if (wr_valid_pu2rob[k] && !ft_tag_bad[`FT_WR_PU2ROB[k].rob_entry])
+                    if (!ft_flag[`FT_WR_PU2ROB[k].rob_entry])  // FT entries gated by comparator below
+                    uop_done_tmr[i][`FT_WR_PU2ROB[k].rob_entry] <= 1'b1;
             end
             for (int e=0; e<`ROB_DEPTH; e++)
                 if (ft_set_done[e]) uop_done_tmr[i][e] <= 1'b1;  // DMR check passed
@@ -728,7 +816,7 @@ module rvv_backend_rob
             ft_k0[e]      = '0;
             ft_k1[e]      = '0;
             for (int k=0; k<`NUM_SMPORT; k++) begin
-                if (wr_valid_pu2rob[k] && (wr_pu2rob[k].rob_entry == (`ROB_DEPTH_WIDTH)'(e))) begin
+                if (wr_valid_pu2rob[k] && (`FT_WR_PU2ROB[k].rob_entry == (`ROB_DEPTH_WIDTH)'(e))) begin
                     if (!ft_hit_any[e]) ft_k0[e] = (NUM_SMPORT_IDX)'(k);
                     else                ft_k1[e] = (NUM_SMPORT_IDX)'(k);
                     ft_hit_any[e] = 1'b1;
@@ -776,6 +864,74 @@ module rvv_backend_rob
             end
         end
     end
+
+  // ---- P2c: result tag plausibility check ------------------------------
+  // The rob_entry tag that steers every PU result back to its entry is the one
+  // piece of DMR that DMR itself does not protect. It is not compared -- it is
+  // what decides WHAT to compare -- so a corrupted tag does not mismatch, it
+  // delivers a correct result to the wrong entry. Two failures follow, and the
+  // machine reports neither: the entry that was waiting never gets its result
+  // (silent hang), and the entry that was not gets a value it never computed
+  // (silent corruption, since res_mem is written unconditionally at :557 with no
+  // ft_flag or entry_valid gate).
+  //
+  // The check costs nothing in the datapath: no tag bits are added and no result
+  // is delayed. It reuses ft_hit_any, already decoded by the comparator above,
+  // and asks only whether the targeted entry could legitimately be expecting a
+  // result -- it must be allocated, and it must not already be finished.
+  //
+  // Index care: entry_valid is PROGRAM order and uop_done is PHYSICAL order, so
+  // physical entry e is entry_valid[e - uop_rptr]. Same mirror as ft_flag above,
+  // and the same one the ASSERT_ON check at :1099 uses in the other direction.
+  //
+  // What it catches: a result written into a free or already-completed entry.
+  // That includes the arbiter's spurious-grant case, where a bogus all-zero
+  // PU2ROB_t lands on entry 0 (priority_reg in u_arb is itself unprotected).
+  // What it does NOT catch, stated so the coverage claim is not overread: a tag
+  // that lands on a DIFFERENT entry which is also legitimately awaiting a result.
+  // Distinguishing that needs the tag to carry its own redundancy (P2a/P2b) --
+  // this check is the zero-datapath-cost complement, not a replacement.
+  //
+  // Deliberately NOT restricted to FT entries. ft_unit was the third conjunct in
+  // the sketch and is dropped: with ARBITER_ON (NUM_SMPORT=4) the port index no
+  // longer identifies the source unit, and PU2ROB_t carries no unit field, so it
+  // would cost datapath bits. More to the point, ft_flag is only meaningful on FT
+  // entries, and the entries that most need this check are the ones with NO DMR
+  // behind them -- reduction, permutation, LSU (INV-5).
+    generate
+      for (i=0; i<`ROB_DEPTH; i++) begin : gen_ft_tag_check
+        assign ft_tag_bad[i] = ft_hit_any[i]
+                             & (~entry_valid[(`ROB_DEPTH_WIDTH'(i) - uop_rptr)]
+                                | uop_done[i]);
+      end
+    endgenerate
+
+  // Unrecoverable by construction: retrying cannot help, because the result that
+  // the waiting entry needed was never delivered to it and is gone. So this goes
+  // straight to fail-stop, joining trap_flag rather than ft_rollback.
+  //
+  // Raised on the RETIRING entry (uop_rptr), not on the entry the bad tag hit.
+  // The victim entry may not be allocated at all, and trap_flag on a free entry
+  // is not observed until something later occupies that slot -- the error would
+  // surface attributed to an unrelated instruction, or not at all. The head of
+  // the queue is the oldest live instruction and retires next, which makes the
+  // report both prompt and attributable, in exactly the way the retry-exhaustion
+  // handoff at gen_ft_trap_req is.
+    assign ft_tag_trap_req = |ft_tag_bad;
+
+`ifndef SYNTHESIS
+  // Same reasoning as the retry-exhaustion trace: a tag fault and a test that
+  // never reached the ROB both just fail to halt, so make the detection visible.
+  always_ff @(posedge clk) begin
+      if (rst_n) begin
+          for (int e=0; e<`ROB_DEPTH; e++)
+              if (ft_tag_bad[e])
+                  $display("FT: implausible result tag -> ROB entry %0d (entry_valid=%0b, uop_done=%0b) -> trap_flag on head %0d",
+                           e, entry_valid[(`ROB_DEPTH_WIDTH'(e) - uop_rptr)],
+                           uop_done[e], uop_rptr);
+      end
+  end
+`endif
 
   // ---- DMR per-entry state: got_first (TMR) ---------------------------
   // got_first: set when the first copy is latched (branch b); cleared on
@@ -1137,6 +1293,10 @@ module rvv_backend_rob
               // global flush fallback (INV-5).
               for (int e=0; e<`ROB_DEPTH; e++)
                   if (ft_trap_req[e]) trap_flag_tmr[i][e] <= 1'b1;
+              // P2c: implausible result tag. Reported on the head entry, not on
+              // the entry the tag hit -- see gen_ft_tag_check for why.
+              if (ft_tag_trap_req)
+                  trap_flag_tmr[i][uop_rptr] <= 1'b1;
 `ifdef FT_TMR_INJECT_ON
               // Sweep point, same placement rationale as uop_done above. This
               // is the sharpest of the four: a stuck trap_flag on a live entry

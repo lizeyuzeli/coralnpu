@@ -47,6 +47,22 @@
 // passed".
 //`define FT_INJECT_PERSIST
 
+// Tag plausibility self-test — default OFF. Only meaningful with
+// FAULT_TOLERANT_ON; rvv_backend_rob.sv $fatal's at elaboration otherwise, for
+// the same reason as FT_INJECT_PERSIST.
+// When ON, the ROB corrupts the rob_entry tag of ONE result, once per run, by
+// flipping its low bit -- modelling the failure the plausibility check exists
+// for: a result delivered to an entry that never asked for it (the fault class
+// measured on mac_unit.sv's rob_entry pipeline register and on u_arb's
+// unprotected priority_reg).
+// This is a DELIBERATELY FAILING mode, like FT_INJECT_PERSIST: the tag error is
+// unrecoverable by construction -- the waiting entry's result is gone -- so the
+// pass criterion is "the check detected it and the trap arrived with mcause=19",
+// NOT "the test passed". Without this switch the check is indistinguishable from
+// a constant 0: the ordinary regression never makes ft_tag_bad fire, so it
+// cannot tell a working detector from one that is silently dead.
+//`define FT_TAG_INJECT_ON
+
 // TMR self-test — default OFF. Only meaningful with FAULT_TOLERANT_ON.
 // When ON, the ROB sweeps the entire (49 protected bit x FT_TMR_COPIES) space
 // during one simulation: each point owns a FT_TMR_INJ_PERIOD-cycle slot, is

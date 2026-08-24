@@ -62,7 +62,11 @@
 extern "C" {
 
 // 0 = the vector instruction completed without trapping.
-// 1 = the trap arrived and every field checked out.
+// 1 = the trap arrived on ft_target and every field checked out. This is the
+//     retry-exhaustion report (FT_INJECT_PERSIST).
+// 2 = the trap arrived on ft_disabled_target, the instruction run with FT off.
+//     That is the tag-plausibility report (FT_TAG_INJECT_ON): the check covers
+//     entries with no DMR behind them, which is what that instruction is.
 volatile uint32_t ft_trap_observed = 0;
 // Reported for diagnosis only; not part of the pass criterion. vstart is what a
 // handler would need to resume, and this is the first thing in the design to
@@ -99,14 +103,22 @@ __attribute__((naked)) void isr_wrapper(void) {
       "sw   t0, 0(t2) \n"
       "li   t1, 19 \n"
       "bne  t0, t1, 2f \n"
-      // mepc must be the vector instruction itself, so that a handler can
-      // re-execute it. A zero or stale mepc is the failure this test exists to
-      // catch: the trap would be unattributable and the instruction unrepeatable.
+      // mepc must be one of the two vector instructions in this program, so that
+      // a handler can attribute and re-execute it. A zero or stale mepc is the
+      // failure this test exists to catch. Which one it is says which mechanism
+      // reported: ft_target is retry exhaustion (the instruction is duplicated),
+      // ft_disabled_target is the tag plausibility check (it is not -- that
+      // check deliberately covers entries with no DMR behind them).
       "csrr t0, mepc \n"
       "la   t2, ft_trap_mepc \n"
       "sw   t0, 0(t2) \n"
+      "li   t3, 1 \n"
       "la   t1, ft_target \n"
+      "beq  t0, t1, 1f \n"
+      "li   t3, 2 \n"
+      "la   t1, ft_disabled_target \n"
       "bne  t0, t1, 2f \n"
+      "1: \n"
       "csrr t0, vstart \n"
       "la   t2, ft_trap_vstart \n"
       "sw   t0, 0(t2) \n"
@@ -127,20 +139,25 @@ __attribute__((naked)) void isr_wrapper(void) {
       "la   t2, ft_trap_status_cleared \n"
       "sw   t0, 0(t2) \n"
       "bnez t0, 2f \n"
-      // The trap is the end of a retry sequence, so the DMR counter must have
-      // counted those retries. Zero here would mean the counter is not wired to
-      // the mechanism it claims to measure -- checked as a lower bound only,
-      // since the exact number follows FT_RETRY_MAX and is reported, not fixed.
+      // The retry-exhaustion trap is the end of a rollback sequence, so the DMR
+      // counter must have counted those rollbacks -- zero would mean the counter
+      // is not wired to the mechanism it claims to measure. Checked as a lower
+      // bound only, since the exact number follows FT_RETRY_MAX. NOT required of
+      // the tag-plausibility trap (t3 == 2): a misdelivered result never
+      // mismatches, so it never rolls back -- that is precisely why a separate
+      // check has to exist for it.
       "csrr t0, 0x7c9 \n"
       "la   t2, ft_ce_cnt \n"
       "sw   t0, 0(t2) \n"
       "csrr t0, 0x7ca \n"
       "la   t2, ft_dmr_cnt \n"
       "sw   t0, 0(t2) \n"
+      "li   t1, 2 \n"
+      "beq  t3, t1, 3f \n"
       "beqz t0, 2f \n"
-      "li   t0, 1 \n"
+      "3: \n"
       "la   t2, ft_trap_observed \n"
-      "sw   t0, 0(t2) \n"
+      "sw   t3, 0(t2) \n"
       ".word 0x08000073 \n"  // mpause (halt) -> success
       "2: ebreak \n"         // wrong cause or wrong pc -> fail
   );
@@ -170,6 +187,8 @@ int main(int argc, char** argv) {
   ft_ctl_cleared = ctl;
   asm volatile(
       "vsetivli x0, 4, e32, m1, ta, ma \n"
+      ".globl ft_disabled_target \n"
+      "ft_disabled_target: \n"
       "vadd.vi v2, v2, 1 \n");
   ft_disabled_ran = 1;
 
