@@ -1245,3 +1245,165 @@ vcs_test_macro_smoke_test(
         "//coralnpu_test_utils/coralflow",
     ],
 )
+
+# ---------------------------------------------------------------------------
+# RVV fault tolerance (fault-tolerance-v3). Same RTL source as
+# rvv_core_mini_axi_model, built with -DRVV_FT_ON (+ RTL injection hooks).
+# ---------------------------------------------------------------------------
+verilator_cocotb_model(
+    name = "rvv_core_mini_axi_ft_model",
+    cflags = VERILATOR_BUILD_ARGS + [
+        "-DRVV_FT_ON",
+        "-DRVV_FT_INJECT_ON",
+    ],
+    hdl_toplevel = "RvvCoreMiniAxi",
+    trace = False,
+    verilog_source = "//hdl/chisel/src/coralnpu:RvvCoreMiniAxi.sv",
+    vlt_tpl = "//coralnpu_test_utils:dispatch.vlt.tpl",
+    deps = [
+        "//hdl/verilog:sram_backdoor",
+    ],
+)
+
+# FT on, no injection: must match the baseline rvv_arithmetic_cocotb_test.
+coralflow_test(
+    name = "rvv_arithmetic_ft_cocotb_test",
+    size = "enormous",
+    srcs = ["rvv_arithmetic_cocotb_test.py"],
+    data = [
+        "//tests/cocotb/rvv/arithmetics:rvv_arith_tests",
+    ],
+    shard_count = 8,
+    targets = ["verilator"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+        requirement("tqdm"),
+    ],
+)
+
+# FT self-test: flip one comparison operand in the 5th DMR comparison of each
+# test. Expected: mismatch -> replay -> correct result, all tests still pass.
+coralflow_test(
+    name = "rvv_arithmetic_ft_inject_cocotb_test",
+    size = "enormous",
+    srcs = ["rvv_arithmetic_cocotb_test.py"],
+    data = [
+        "//tests/cocotb/rvv/arithmetics:rvv_arith_tests",
+    ],
+    test_args = ["+RVV_FT_INJ_N=5"],
+    shard_count = 8,
+    targets = ["verilator"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+        requirement("tqdm"),
+    ],
+)
+
+# FT self-test: persistent fault from the 5th comparison on. Expected: retries
+# exhausted -> RVV trap (mcause=2, sentinel mtval) -> ebreak -> io_fault, so
+# the arithmetic test itself FAILS. Manual only; inspect the log.
+coralflow_test(
+    name = "rvv_arithmetic_ft_trap_cocotb_test",
+    size = "large",
+    srcs = ["rvv_arithmetic_cocotb_test.py"],
+    data = [
+        "//tests/cocotb/rvv/arithmetics:rvv_arith_tests",
+    ],
+    test_args = [
+        "+RVV_FT_INJ_N=5",
+        "+RVV_FT_INJ_PERSIST=1",
+    ],
+    tags = ["manual"],
+    targets = ["verilator"],
+    testcases = ["binary_op_vx"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+        requirement("tqdm"),
+    ],
+)
+
+# FT-on variants of the other RVV suites (architectural invisibility).
+coralflow_test(
+    name = "rvv_load_store_ft_test",
+    size = "enormous",
+    srcs = ["rvv_load_store_test.py"],
+    data = ["//tests/cocotb/rvv/load_store:rvv_load_store_tests"],
+    hdl_toplevel = "RvvCoreMiniAxi",
+    shard_count = 8,
+    targets = ["verilator"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "//coralnpu_test_utils:rvv_type_util",
+        "@bazel_tools//tools/python/runfiles",
+        requirement("tqdm"),
+    ],
+)
+
+coralflow_test(
+    name = "rvv_assembly_ft_cocotb_test",
+    size = "large",
+    srcs = ["rvv_assembly_cocotb_test.py"],
+    data = ["//tests/cocotb/rvv:rvv_assem_tests"],
+    hdl_toplevel = "RvvCoreMiniAxi",
+    shard_count = 8,
+    targets = ["verilator"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "//coralnpu_test_utils:core_mini_axi_sim_interface",
+        "//coralnpu_test_utils:dispatch_verifier",
+        "//coralnpu_test_utils:rvv_type_util",
+        requirement("tqdm"),
+        "@bazel_tools//tools/python/runfiles",
+    ],
+)
+
+coralflow_test(
+    name = "rvv_ml_ops_ft_cocotb_test",
+    size = "enormous",
+    srcs = ["rvv_ml_ops_cocotb_test.py"],
+    data = ["//tests/cocotb/rvv/ml_ops:rvv_mlop_tests"],
+    shard_count = 5,
+    targets = ["verilator"],
+    verilator_model = ":rvv_core_mini_axi_ft_model",
+    deps = [
+        "//sw/utils:metrics",
+        requirement("ml_dtypes"),
+        "@bazel_tools//tools/python/runfiles",
+    ],
+)
+
+vcs_cocotb_model(
+    name = "rvv_core_mini_axi_ft_vcs_model",
+    build_args = VCS_BUILD_ARGS,
+    data = VCS_COMMON_DATA,
+    defines = dict(
+        VCS_DEFINES,
+        RVV_FT_INJECT_ON = "",
+        RVV_FT_ON = "",
+    ),
+    hdl_toplevel = "RvvCoreMiniAxi",
+    tags = [
+        "manual",
+        "rtl",
+        "vcs",
+    ],
+    verilog_sources = ["//hdl/chisel/src/coralnpu:rvv_core_mini_axi_cc_library_verilog"],
+)
+
+coralflow_test(
+    name = "rvv_arithmetic_ft_vcs_cocotb_test",
+    size = "enormous",
+    srcs = ["rvv_arithmetic_cocotb_test.py"],
+    data = ["//tests/cocotb/rvv/arithmetics:rvv_arith_tests"],
+    exclude_testcases = {"vcs": ["*bf16*"]},
+    shard_count = 8,
+    targets = ["vcs"],
+    vcs_model = ":rvv_core_mini_axi_ft_vcs_model",
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+        requirement("tqdm"),
+    ],
+)

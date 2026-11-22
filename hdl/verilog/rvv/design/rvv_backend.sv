@@ -74,9 +74,17 @@ module rvv_backend
 
     rd_valid_rob2rt_o,
     rd_rob2rt_o,
+`ifdef RVV_FT_ON
+    ft_trap_valid_o,
+    ft_trap_data_o,
+`endif
 
     rvv_idle
 );
+`ifdef RVV_FT_ON
+    output  logic                                 ft_trap_valid_o;
+    output  RVVInstruction                        ft_trap_data_o;
+`endif
 // global signal
     input   logic                                 clk;
     input   logic                                 rst_n;
@@ -594,6 +602,23 @@ module rvv_backend
         .rob_entry            (uop_rob2dp)
     );
 
+`ifdef RVV_FT_ON
+  // RVV fault tolerance: DMR between dispatch/RS and arbiter/ROB
+    logic         [`NUM_DP_UOP-1:0]       rs_valid_ft2alu;
+    ALU_RS_t      [`NUM_DP_UOP-1:0]       rs_ft2alu;
+    logic         [`NUM_DP_UOP-1:0]       rs_valid_ft2mul;
+    MUL_RS_t      [`NUM_DP_UOP-1:0]       rs_ft2mul;
+    logic         [`NUM_DP_UOP-1:0]       rs_valid_ft2div;
+    DIV_RS_t      [`NUM_DP_UOP-1:0]       rs_ft2div;
+  `ifdef ZVE32F_ON
+    logic         [`NUM_DP_UOP-1:0]       rs_valid_ft2falu;
+    FALU_RS_t     [`NUM_DP_UOP-1:0]       rs_ft2falu;
+  `endif
+    logic         [`NUM_SMPORT-1:0]       res_valid_ft2rob;
+    PU2ROB_t      [`NUM_SMPORT-1:0]       res_ft2rob;
+
+`endif
+
   // RS, Reserve station
     // ALU RS
     multi_fifo #(
@@ -608,9 +633,17 @@ module rvv_backend
         .clk          (clk),
         .rst_n        (rst_n),
       // write
+`ifdef RVV_FT_ON
+        .push         (rs_valid_ft2alu),
+`else
         .push         (rs_valid_dp2alu),
+`endif
         .pushRdy      (rs_ready_alu2dp),
+`ifdef RVV_FT_ON
+        .datain       (rs_ft2alu),
+`else
         .datain       (rs_dp2alu),
+`endif
       // read
         .pop          (pop_alu2rs),
         .dataout      (uop_rs2alu),
@@ -680,9 +713,17 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+`ifdef RVV_FT_ON
+        .push           (rs_valid_ft2mul),
+`else
         .push           (rs_valid_dp2mul),
+`endif
         .pushRdy        (rs_ready_mul2dp),
+`ifdef RVV_FT_ON
+        .datain         (rs_ft2mul),
+`else
         .datain         (rs_dp2mul),
+`endif
       // read
         .pop            (pop_mul2rs),
         .dataout        (uop_rs2mul),
@@ -716,9 +757,17 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+`ifdef RVV_FT_ON
+        .push           (rs_valid_ft2div),
+`else
         .push           (rs_valid_dp2div),
+`endif
         .pushRdy        (rs_ready_div2dp),
+`ifdef RVV_FT_ON
+        .datain         (rs_ft2div),
+`else
         .datain         (rs_dp2div),
+`endif
       // read
         .pop            (pop_div2rs),
         .dataout        (uop_rs2div),
@@ -753,9 +802,17 @@ module rvv_backend
         .clk            (clk),
         .rst_n          (rst_n),
       // write
+`ifdef RVV_FT_ON
+        .push           (rs_valid_ft2falu),
+`else
         .push           (rs_valid_dp2falu),
+`endif
         .pushRdy        (rs_ready_falu2dp),
+`ifdef RVV_FT_ON
+        .datain         (rs_ft2falu),
+`else
         .datain         (rs_dp2falu),
+`endif
       // read
         .pop            (pop_falu2rs),       
         .dataout        (uop_rs2falu),       
@@ -1210,6 +1267,45 @@ module rvv_backend
     assign res_ready_arb2pu  = '1;
 `endif
 
+`ifdef RVV_FT_ON
+    rvv_backend_ft u_ft (
+        .clk              (clk),
+        .rst_n            (rst_n),
+        .flush            (trap_flush_rvv),
+        .rob_rptr         (rob_entry_rob2rt),
+        .uop_valid_dp2rob (uop_valid_dp2rob),
+        .uop_dp2rob       (uop_dp2rob),
+        .rs_valid_dp2alu  (rs_valid_dp2alu),
+        .rs_dp2alu        (rs_dp2alu),
+        .rs_ready_alu2dp  (rs_ready_alu2dp),
+        .rs_valid_dp2mul  (rs_valid_dp2mul),
+        .rs_dp2mul        (rs_dp2mul),
+        .rs_ready_mul2dp  (rs_ready_mul2dp),
+        .rs_valid_dp2div  (rs_valid_dp2div),
+        .rs_dp2div        (rs_dp2div),
+        .rs_ready_div2dp  (rs_ready_div2dp),
+      `ifdef ZVE32F_ON
+        .rs_valid_dp2falu (rs_valid_dp2falu),
+        .rs_dp2falu       (rs_dp2falu),
+        .rs_ready_falu2dp (rs_ready_falu2dp),
+        .rs_valid_ft2falu (rs_valid_ft2falu),
+        .rs_ft2falu       (rs_ft2falu),
+      `endif
+        .rs_valid_ft2alu  (rs_valid_ft2alu),
+        .rs_ft2alu        (rs_ft2alu),
+        .rs_valid_ft2mul  (rs_valid_ft2mul),
+        .rs_ft2mul        (rs_ft2mul),
+        .rs_valid_ft2div  (rs_valid_ft2div),
+        .rs_ft2div        (rs_ft2div),
+        .res_valid_arb2ft (res_valid_arb2rob),
+        .res_arb2ft       (res_arb2rob),
+        .res_valid_ft2rob (res_valid_ft2rob),
+        .res_ft2rob       (res_ft2rob),
+        .trap_valid_o     (ft_trap_valid_o),
+        .trap_data_o      (ft_trap_data_o)
+    );
+`endif
+
   // ROB, Re-Order Buffer
     rvv_backend_rob #(
     ) u_rob (
@@ -1223,8 +1319,13 @@ module rvv_backend
         .rob_empty              (rob_empty),
         .rob_entry_rob2dp       (rob_entry_rob2dp),
       // PU to ROB
+`ifdef RVV_FT_ON
+        .wr_valid_pu2rob        (res_valid_ft2rob),
+        .wr_pu2rob              (res_ft2rob),
+`else
         .wr_valid_pu2rob        (res_valid_arb2rob),
         .wr_pu2rob              (res_arb2rob),
+`endif
         .ff_tail_index          (res_ff_tail_index),
       // ROB to RT
         .rd_valid_rob2rt        (rd_valid_rob2rt),

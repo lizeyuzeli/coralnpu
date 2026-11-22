@@ -125,6 +125,7 @@ exports_files(
         "rvv_backend_pmtrdt_unit_reduction_alu.sv",  # New
         "rvv_backend_retire.sv",
         "rvv_backend_retire_waw.sv",  # New
+        "rvv_backend_ft.sv",
         "rvv_backend_rob.sv",
         "rvv_backend_sqrt7_rec7.sv",  # New
         "rvv_backend_vrf.sv",

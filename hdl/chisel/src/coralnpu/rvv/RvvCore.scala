@@ -946,6 +946,7 @@ class RvvCoreWrapper(p: Parameters)
   addResource("hdl/verilog/rvv/design/rvv_backend_retire_waw.sv") // New
   addResource("hdl/verilog/rvv/design/rvv_backend_retire.sv")
   addResource("hdl/verilog/rvv/design/rvv_backend_rob.sv")
+  addResource("hdl/verilog/rvv/design/rvv_backend_ft.sv") // FT (empty unless RVV_FT_ON)
   addResource("hdl/verilog/rvv/design/rvv_backend_vrf_reg.sv")
   addResource("hdl/verilog/rvv/design/rvv_backend_vrf.sv")
   addResource("hdl/verilog/rvv/design/rvv_backend_falu_unit.sv")

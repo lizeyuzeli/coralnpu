@@ -235,6 +235,7 @@ chisel_library(
         "//hdl/verilog/rvv/design:rvv_backend_pmtrdt_unit_reduction.sv",
         "//hdl/verilog/rvv/design:rvv_backend_retire_waw.sv",
         "//hdl/verilog/rvv/design:rvv_backend_retire.sv",
+        "//hdl/verilog/rvv/design:rvv_backend_ft.sv",
         "//hdl/verilog/rvv/design:rvv_backend_rob.sv",
         "//hdl/verilog/rvv/design:rvv_backend_vrf.sv",
         "//hdl/verilog/rvv/design:rvv_backend_vrf_reg.sv",

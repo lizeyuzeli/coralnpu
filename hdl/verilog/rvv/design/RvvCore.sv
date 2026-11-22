@@ -132,6 +132,16 @@ module RvvCore #(parameter N = 4,
   input  logic vmeRtRdy_i
 `endif
 );
+`ifdef RVV_FT_ON
+  // Frontend traps and backend FT traps share the trap output. The backend
+  // entry is older than anything still in the frontend, so it wins.
+  logic          fe_trap_valid;
+  RVVInstruction fe_trap_data;
+  logic          ft_trap_valid;
+  RVVInstruction ft_trap_data;
+  assign trap_valid_o = ft_trap_valid | fe_trap_valid;
+  assign trap_data_o  = ft_trap_valid ? ft_trap_data : fe_trap_data;
+`endif
   logic [N-1:0] frontend_cmd_valid;
   RVVCmd [N-1:0] frontend_cmd_data;
   logic [$clog2(2*N + 1)-1:0] queue_capacity_internal;
@@ -159,8 +169,13 @@ module RvvCore #(parameter N = 4,
       .cmd_data_o(frontend_cmd_data),
       .queue_capacity_i(queue_capacity_internal),
       .queue_capacity_o(queue_capacity),
+`ifdef RVV_FT_ON
+      .trap_valid_o(fe_trap_valid),
+      .trap_data_o(fe_trap_data),
+`else
       .trap_valid_o(trap_valid_o),
       .trap_data_o(trap_data_o),
+`endif
       .config_state_valid(config_state_valid),
       .config_state(config_state),
       .vme_mtype_valid_o(vme_mtype_valid_o),
@@ -349,6 +364,10 @@ module RvvCore #(parameter N = 4,
       .vector_csr(vector_csr),
       .vcsr_ready(vcsr_ready),
       .rd_valid_rob2rt_o(rd_valid_rob2rt_o),
+`ifdef RVV_FT_ON
+      .ft_trap_valid_o(ft_trap_valid),
+      .ft_trap_data_o(ft_trap_data),
+`endif
       .rvv_idle(rvv_backend_idle),
       .rd_rob2rt_o(rd_rob2rt_o)
 `ifdef ZVT_ON
